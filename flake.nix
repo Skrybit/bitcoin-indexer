@@ -48,7 +48,13 @@
             lz4
             zstd
             libunwind
+            rocksdb
           ];
+
+          # Use system rocksdb instead of compiling from source (avoids gcc 15 issue)
+          ROCKSDB_LIB_DIR = "${pkgs.rocksdb}/lib";
+          ROCKSDB_INCLUDE_DIR = "${pkgs.rocksdb}/include";
+          SNAPPY_LIB_DIR = "${pkgs.snappy}/lib";
 
           buildFeatures = [ "release" ];
 
