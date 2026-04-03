@@ -167,7 +167,8 @@ async fn new_ordinals_indexer_runloop(
         db::ordinals_pg::get_chain_tip(&ord_client).await?
     };
     let blocks_chain_tip = {
-        let blocks_db = open_blocks_db_with_retry(false, config, ctx);
+        // Use readwrite mode to create the rocksdb if it doesn't exist (first run).
+        let blocks_db = open_blocks_db_with_retry(true, config, ctx);
         let height = find_last_block_inserted(&blocks_db);
         // Blocks DB does not have the hash available.
         if height > 0 {
