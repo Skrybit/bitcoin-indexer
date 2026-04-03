@@ -28,6 +28,7 @@
             pkg-config
             llvmPackages_18.clang
             llvmPackages_18.llvm
+            rustPlatform.bindgenHook
           ];
 
           buildInputs = with pkgs; [
@@ -43,8 +44,10 @@
 
           buildFeatures = [ "release" ];
 
-          # LLVM/Clang needed at build time for rocksdb
+          # Force clang for C/C++ compilation (rocksdb needs it)
           LIBCLANG_PATH = "${pkgs.llvmPackages_18.libclang.lib}/lib";
+          CC = "${pkgs.llvmPackages_18.clang}/bin/clang";
+          CXX = "${pkgs.llvmPackages_18.clang}/bin/clang++";
 
           doCheck = false; # Tests require a running bitcoind + postgres
 
