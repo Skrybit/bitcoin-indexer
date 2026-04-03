@@ -12,7 +12,10 @@
         pkgs = nixpkgs.legacyPackages.${system};
 
         # ── Rust indexer binary ──
-        bitcoin-indexer = pkgs.rustPlatform.buildRustPackage {
+        # Use clang stdenv — rocksdb C++ compilation fails with gcc 15
+        clangStdenv = pkgs.llvmPackages_18.stdenv;
+
+        bitcoin-indexer = pkgs.rustPlatform.buildRustPackage.override { stdenv = clangStdenv; } {
           pname = "bitcoin-indexer";
           version = "3.0.0";
           src = ./.;
