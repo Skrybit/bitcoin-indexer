@@ -32,10 +32,12 @@ pub fn bitcoind_get_chain_tip(config: &BitcoindConfig, ctx: &Context) -> BlockId
         match bitcoin_rpc.call::<serde_json::Value>("getblockchaininfo", &[]) {
             Ok(result) => {
                 let blocks = result["blocks"].as_u64().unwrap_or(0);
-                let hash = result["bestblockhash"].as_str().unwrap_or("0000000000000000000000000000000000000000000000000000000000000000");
+                let default_hash = "0000000000000000000000000000000000000000000000000000000000000000";
+                let hash = result["bestblockhash"].as_str().unwrap_or(default_hash);
+                let full_hash = if hash.starts_with("0x") { hash.to_string() } else { format!("0x{}", hash) };
                 return BlockIdentifier {
                     index: blocks,
-                    hash: format!("0x{}", hash),
+                    hash: full_hash,
                 };
             }
             Err(e) => {
@@ -95,7 +97,9 @@ pub fn bitcoind_wait_for_chain_tip(config: &BitcoindConfig, ctx: &Context) -> Bl
                 let blocks = result["blocks"].as_u64().unwrap_or(0);
                 let headers = result["headers"].as_u64().unwrap_or(0);
                 let ibd = result["initialblockdownload"].as_bool().unwrap_or(true);
-                let hash = result["bestblockhash"].as_str().unwrap_or("0000000000000000000000000000000000000000000000000000000000000000");
+                let default_hash = "0000000000000000000000000000000000000000000000000000000000000000";
+                let hash = result["bestblockhash"].as_str().unwrap_or(default_hash);
+                let full_hash = if hash.starts_with("0x") { hash.to_string() } else { format!("0x{}", hash) };
 
                 if !ibd && blocks == headers {
                     confirmations += 1;
@@ -103,7 +107,7 @@ pub fn bitcoind_wait_for_chain_tip(config: &BitcoindConfig, ctx: &Context) -> Bl
                         try_info!(ctx, "bitcoind chain tip is at block #{}", blocks);
                         return BlockIdentifier {
                             index: blocks,
-                            hash: format!("0x{}", hash),
+                            hash: full_hash,
                         };
                     }
                     if !logged_info {
