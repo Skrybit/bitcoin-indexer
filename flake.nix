@@ -52,10 +52,15 @@
 
           buildFeatures = [ "release" ];
 
-          # Force clang for C/C++ compilation (rocksdb needs it)
+          # Force clang for ALL C/C++ compilation including cc-rs (rocksdb)
           LIBCLANG_PATH = "${pkgs.llvmPackages_18.libclang.lib}/lib";
           CC = "${pkgs.llvmPackages_18.clang}/bin/clang";
           CXX = "${pkgs.llvmPackages_18.clang}/bin/clang++";
+          # cc-rs uses TARGET_CC/TARGET_CXX to find the compiler
+          TARGET_CC = "${pkgs.llvmPackages_18.clang}/bin/clang";
+          TARGET_CXX = "${pkgs.llvmPackages_18.clang}/bin/clang++";
+          HOST_CC = "${pkgs.llvmPackages_18.clang}/bin/clang";
+          HOST_CXX = "${pkgs.llvmPackages_18.clang}/bin/clang++";
 
           doCheck = false; # Tests require a running bitcoind + postgres
 
