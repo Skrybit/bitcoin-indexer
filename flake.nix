@@ -17,7 +17,12 @@
           version = "3.0.0";
           src = ./.;
 
-          cargoLock.lockFile = ./Cargo.lock;
+          cargoLock = {
+            lockFile = ./Cargo.lock;
+            outputHashes = {
+              "schemars-0.8.16" = "sha256-xg7TUTxo+7vDSOQQuWkTl0ajcvO9iP9IP8x8uWUcFqM=";
+            };
+          };
 
           nativeBuildInputs = with pkgs; [
             pkg-config
