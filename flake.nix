@@ -51,7 +51,11 @@
           ];
 
           # Let librocksdb-sys compile its bundled rocksdb 9.9.3 from source.
-          # The clang stdenv ensures clang is used instead of gcc 15 (which breaks rocksdb C++).
+          # Force clang for cc-rs via the Cargo target wrapper env vars.
+          # Nix's Rust build infra hardcodes gcc — these override it.
+          CARGO_BUILD_TARGET = "x86_64-unknown-linux-gnu";
+          "CC_x86_64-unknown-linux-gnu" = "${pkgs.llvmPackages_18.clang}/bin/clang";
+          "CXX_x86_64-unknown-linux-gnu" = "${pkgs.llvmPackages_18.clang}/bin/clang++";
 
           buildFeatures = [ "release" ];
 
