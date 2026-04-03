@@ -14,8 +14,8 @@ serde_derive = "1"
 hiro-system-kit = { workspace = true }
 rocket = { version = "=0.5.0", features = ["json"] }
 bitcoin = { workspace = true }
-bitcoincore-rpc = "0.19.0"
-bitcoincore-rpc-json = "0.19.0"
+bitcoincore-rpc = "0.18.0"
+bitcoincore-rpc-json = "0.18.0"
 reqwest = { version = "0.12", default-features = false, features = [
     "blocking",
     "json",

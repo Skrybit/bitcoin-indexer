@@ -25,14 +25,17 @@ pub fn bitcoind_get_client(config: &BitcoindConfig, ctx: &Context) -> Client {
 }
 
 /// Retrieves the chain tip from bitcoind.
+/// Uses raw JSON-RPC to handle Bitcoin Core 28+ `warnings` field change.
 pub fn bitcoind_get_chain_tip(config: &BitcoindConfig, ctx: &Context) -> BlockIdentifier {
     let bitcoin_rpc = bitcoind_get_client(config, ctx);
     loop {
-        match bitcoin_rpc.get_blockchain_info() {
+        match bitcoin_rpc.call::<serde_json::Value>("getblockchaininfo", &[]) {
             Ok(result) => {
+                let blocks = result["blocks"].as_u64().unwrap_or(0);
+                let hash = result["bestblockhash"].as_str().unwrap_or("0000000000000000000000000000000000000000000000000000000000000000");
                 return BlockIdentifier {
-                    index: result.blocks,
-                    hash: format!("0x{}", result.best_block_hash),
+                    index: blocks,
+                    hash: format!("0x{}", hash),
                 };
             }
             Err(e) => {
@@ -81,22 +84,26 @@ pub fn bitcoin_get_raw_transaction(
 }
 
 /// Checks if bitcoind is still synchronizing blocks and waits until it's finished if that is the case.
+/// Uses raw JSON-RPC to handle Bitcoin Core 28+ response format changes.
 pub fn bitcoind_wait_for_chain_tip(config: &BitcoindConfig, ctx: &Context) -> BlockIdentifier {
     let bitcoin_rpc = bitcoind_get_client(config, ctx);
     let mut confirmations = 0;
     let mut logged_info = false;
     loop {
-        match bitcoin_rpc.get_blockchain_info() {
+        match bitcoin_rpc.call::<serde_json::Value>("getblockchaininfo", &[]) {
             Ok(result) => {
-                if !result.initial_block_download && result.blocks == result.headers {
+                let blocks = result["blocks"].as_u64().unwrap_or(0);
+                let headers = result["headers"].as_u64().unwrap_or(0);
+                let ibd = result["initialblockdownload"].as_bool().unwrap_or(true);
+                let hash = result["bestblockhash"].as_str().unwrap_or("0000000000000000000000000000000000000000000000000000000000000000");
+
+                if !ibd && blocks == headers {
                     confirmations += 1;
-                    // Wait for 10 confirmations before declaring node is at chain tip, just in case it's still connecting to
-                    // peers.
                     if confirmations == 10 {
-                        try_info!(ctx, "bitcoind chain tip is at block #{}", result.blocks);
+                        try_info!(ctx, "bitcoind chain tip is at block #{}", blocks);
                         return BlockIdentifier {
-                            index: result.blocks,
-                            hash: format!("0x{}", result.best_block_hash),
+                            index: blocks,
+                            hash: format!("0x{}", hash),
                         };
                     }
                     if !logged_info {
