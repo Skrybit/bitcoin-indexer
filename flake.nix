@@ -48,13 +48,10 @@
             lz4
             zstd
             libunwind
-            rocksdb
           ];
 
-          # Use system rocksdb instead of compiling from source (avoids gcc 15 issue)
-          ROCKSDB_LIB_DIR = "${pkgs.rocksdb}/lib";
-          ROCKSDB_INCLUDE_DIR = "${pkgs.rocksdb}/include";
-          SNAPPY_LIB_DIR = "${pkgs.snappy}/lib";
+          # Let librocksdb-sys compile its bundled rocksdb 9.9.3 from source.
+          # The clang stdenv ensures clang is used instead of gcc 15 (which breaks rocksdb C++).
 
           buildFeatures = [ "release" ];
 
