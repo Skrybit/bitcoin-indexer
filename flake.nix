@@ -14,8 +14,13 @@
         # ── Rust indexer binary ──
         # Use clang stdenv — rocksdb C++ compilation fails with gcc 15
         clangStdenv = pkgs.llvmPackages_18.stdenv;
+        rustPlatformClang = pkgs.makeRustPlatform {
+          rustc = pkgs.rustc;
+          cargo = pkgs.cargo;
+          stdenv = clangStdenv;
+        };
 
-        bitcoin-indexer = pkgs.rustPlatform.buildRustPackage.override { stdenv = clangStdenv; } {
+        bitcoin-indexer = rustPlatformClang.buildRustPackage {
           pname = "bitcoin-indexer";
           version = "3.0.0";
           src = ./.;
