@@ -56,6 +56,8 @@
           CARGO_BUILD_TARGET = "x86_64-unknown-linux-gnu";
           "CC_x86_64-unknown-linux-gnu" = "${pkgs.llvmPackages_18.clang}/bin/clang";
           "CXX_x86_64-unknown-linux-gnu" = "${pkgs.llvmPackages_18.clang}/bin/clang++";
+          # rocksdb 9.9.3 missing #include <cstdint> — clang 18 is strict about this
+          CXXFLAGS = "-include cstdint";
 
           buildFeatures = [ "release" ];
 
