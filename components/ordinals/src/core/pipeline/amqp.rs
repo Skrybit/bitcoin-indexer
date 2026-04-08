@@ -1,13 +1,13 @@
 //! AMQP event publisher — publishes block.indexed events to RabbitMQ.
 //!
-//! Initialized once at startup. If AMQP is not configured or connection
-//! fails, all publish calls are silent no-ops (indexing never fails
-//! because of messaging).
+//! Uses `amqprs` crate for async AMQP 0.9.1 communication.
+//! If AMQP is not configured or connection fails, all publish calls
+//! are silent no-ops (indexing never fails because of messaging).
 
-use lapin::{
-    options::{BasicPublishOptions, ExchangeDeclareOptions},
-    types::FieldTable,
-    BasicProperties, Channel, Connection, ConnectionProperties, ExchangeKind,
+use amqprs::{
+    channel::{BasicPublishArguments, Channel, ExchangeDeclareArguments},
+    connection::{Connection, OpenConnectionArguments},
+    BasicProperties,
 };
 use tokio::sync::OnceCell;
 
@@ -19,23 +19,28 @@ static EXCHANGE_NAME: OnceCell<String> = OnceCell::const_new();
 /// overrides the config file URL (allows SOPS secret injection).
 pub async fn init(url: &str, exchange: &str) -> Result<(), String> {
     let effective_url = std::env::var("AMQP_URL").unwrap_or_else(|_| url.to_string());
-    let conn = Connection::connect(&effective_url, ConnectionProperties::default())
+
+    // Parse amqp://user:pass@host:port
+    let parsed = url::Url::parse(&effective_url)
+        .map_err(|e| format!("Invalid AMQP URL: {e}"))?;
+    let host = parsed.host_str().unwrap_or("localhost");
+    let port = parsed.port().unwrap_or(5672);
+    let user = parsed.username();
+    let password = parsed.password().unwrap_or("");
+
+    let args = OpenConnectionArguments::new(host, port, user, password);
+
+    let connection = Connection::open(&args)
         .await
         .map_err(|e| format!("AMQP connect failed: {e}"))?;
-    let channel = conn
-        .create_channel()
+
+    let channel = connection
+        .open_channel(None)
         .await
         .map_err(|e| format!("AMQP channel failed: {e}"))?;
+
     channel
-        .exchange_declare(
-            exchange,
-            ExchangeKind::Topic,
-            ExchangeDeclareOptions {
-                durable: true,
-                ..Default::default()
-            },
-            FieldTable::default(),
-        )
+        .exchange_declare(ExchangeDeclareArguments::new(exchange, "topic").durable(true).finish())
         .await
         .map_err(|e| format!("AMQP exchange declare failed: {e}"))?;
 
@@ -45,6 +50,7 @@ pub async fn init(url: &str, exchange: &str) -> Result<(), String> {
     CHANNEL
         .set(channel)
         .map_err(|_| "AMQP channel already initialized".to_string())?;
+
     Ok(())
 }
 
@@ -76,20 +82,19 @@ pub async fn publish_block_event(
         "timestamp": chrono::Utc::now().to_rfc3339(),
     });
 
+    let args = BasicPublishArguments::new(exchange, routing_key);
+
     channel
         .basic_publish(
-            exchange,
-            routing_key,
-            BasicPublishOptions::default(),
-            payload.to_string().as_bytes(),
             BasicProperties::default()
-                .with_content_type("application/json".into())
-                .with_delivery_mode(2), // persistent
+                .with_content_type("application/json")
+                .with_delivery_mode(2) // persistent
+                .finish(),
+            payload.to_string().into_bytes(),
+            args,
         )
         .await
-        .map_err(|e| format!("AMQP publish failed: {e}"))?
-        .await
-        .map_err(|e| format!("AMQP publish confirm failed: {e}"))?;
+        .map_err(|e| format!("AMQP publish failed: {e}"))?;
 
     Ok(())
 }

@@ -241,8 +241,8 @@ pub async fn index_block(
                 &amqp.routing_key,
                 block_height,
                 &block.block_identifier.hash,
-                reveals_count,
-                transfers_count,
+                reveals_count as u64,
+                transfers_count as u64,
                 stopwatch.elapsed().as_millis() as u64,
             )
             .await

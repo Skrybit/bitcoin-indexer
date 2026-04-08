@@ -165,6 +165,7 @@ impl Config {
                 enabled: true,
                 prometheus_port: 9153,
             }),
+            amqp: None,
         }
     }
 
