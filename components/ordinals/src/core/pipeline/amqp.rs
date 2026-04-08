@@ -15,9 +15,11 @@ static CHANNEL: OnceCell<Channel> = OnceCell::const_new();
 static EXCHANGE_NAME: OnceCell<String> = OnceCell::const_new();
 
 /// Initialize the AMQP connection and declare the exchange.
-/// Called once at indexer startup.
+/// Called once at indexer startup. If AMQP_URL env var is set, it
+/// overrides the config file URL (allows SOPS secret injection).
 pub async fn init(url: &str, exchange: &str) -> Result<(), String> {
-    let conn = Connection::connect(url, ConnectionProperties::default())
+    let effective_url = std::env::var("AMQP_URL").unwrap_or_else(|_| url.to_string());
+    let conn = Connection::connect(&effective_url, ConnectionProperties::default())
         .await
         .map_err(|e| format!("AMQP connect failed: {e}"))?;
     let channel = conn
