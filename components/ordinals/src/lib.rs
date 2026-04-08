@@ -17,7 +17,7 @@ use std::{
 };
 
 use bitcoind::{
-    start_bitcoin_indexer, try_debug, try_info,
+    start_bitcoin_indexer, try_debug, try_info, try_warn,
     types::BlockIdentifier,
     utils::{future_block_on, Context},
     Indexer, IndexerCommand,
@@ -64,6 +64,16 @@ async fn new_ordinals_indexer_runloop(
     config: &Config,
     ctx: &Context,
 ) -> Result<Indexer, String> {
+    // Initialize AMQP connection for block event publishing
+    if let Some(ref amqp) = config.amqp {
+        if amqp.enabled {
+            match core::pipeline::amqp::init(&amqp.url, &amqp.exchange).await {
+                Ok(()) => try_info!(ctx, "AMQP connected to {}", amqp.url),
+                Err(e) => try_warn!(ctx, "AMQP init failed (non-fatal): {e}"),
+            }
+        }
+    }
+
     let (commands_tx, commands_rx) =
         crossbeam_channel::bounded(config.resources.indexer_channel_capacity);
     let pg_pools = pg_pools(config);

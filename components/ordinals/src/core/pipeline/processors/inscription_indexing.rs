@@ -234,6 +234,24 @@ pub async fn index_block(
         }
     }
 
+    // Publish block.indexed event to RabbitMQ (non-fatal on failure)
+    if let Some(ref amqp) = config.amqp {
+        if amqp.enabled {
+            if let Err(e) = crate::core::pipeline::amqp::publish_block_event(
+                &amqp.routing_key,
+                block_height,
+                &block.block_identifier.hash,
+                reveals_count,
+                transfers_count,
+                stopwatch.elapsed().as_millis() as u64,
+            )
+            .await
+            {
+                try_warn!(ctx, "AMQP publish failed (non-fatal): {e}");
+            }
+        }
+    }
+
     // Record overall processing time
     let elapsed = stopwatch.elapsed();
     prometheus.metrics_record_block_processing_time(elapsed.as_millis() as f64);

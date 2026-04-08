@@ -6,7 +6,7 @@ use std::{
 use bitcoin::Network;
 
 use crate::{
-    BitcoindConfig, Config, MetricsConfig, OrdinalsBrc20Config, OrdinalsConfig,
+    AmqpConfig, BitcoindConfig, Config, MetricsConfig, OrdinalsBrc20Config, OrdinalsConfig,
     OrdinalsMetaProtocolsConfig, PgDatabaseConfig, ResourcesConfig, RunesConfig, StorageConfig,
     DEFAULT_BITCOIND_RPC_THREADS, DEFAULT_BITCOIND_RPC_TIMEOUT, DEFAULT_INDEXER_CHANNEL_CAPACITY,
     DEFAULT_LRU_CACHE_SIZE, DEFAULT_MEMORY_AVAILABLE, DEFAULT_ULIMIT, DEFAULT_WORKING_DIR,
@@ -92,6 +92,14 @@ pub struct MetricsConfigToml {
 }
 
 #[derive(Deserialize, Debug, Clone)]
+pub struct AmqpConfigToml {
+    pub enabled: Option<bool>,
+    pub url: String,
+    pub exchange: Option<String>,
+    pub routing_key: Option<String>,
+}
+
+#[derive(Deserialize, Debug, Clone)]
 pub struct ConfigToml {
     pub storage: StorageConfigToml,
     pub ordinals: Option<OrdinalsConfigToml>,
@@ -99,6 +107,7 @@ pub struct ConfigToml {
     pub bitcoind: BitcoindConfigToml,
     pub resources: ResourcesConfigToml,
     pub metrics: Option<MetricsConfigToml>,
+    pub amqp: Option<AmqpConfigToml>,
 }
 
 impl ConfigToml {
@@ -161,6 +170,13 @@ impl ConfigToml {
             prometheus_port: metrics.prometheus_port,
         });
 
+        let amqp = toml.amqp.map(|a| AmqpConfig {
+            enabled: a.enabled.unwrap_or(true),
+            url: a.url,
+            exchange: a.exchange.unwrap_or_else(|| "blockchain".to_string()),
+            routing_key: a.routing_key.unwrap_or_else(|| "block.indexed".to_string()),
+        });
+
         let config = Config {
             storage: StorageConfig {
                 working_dir: toml
@@ -170,6 +186,7 @@ impl ConfigToml {
             },
             ordinals,
             runes,
+            amqp,
             resources: ResourcesConfig {
                 ulimit: toml.resources.ulimit.unwrap_or(DEFAULT_ULIMIT),
                 cpu_core_available: toml.resources.cpu_core_available.unwrap_or(num_cpus::get()),

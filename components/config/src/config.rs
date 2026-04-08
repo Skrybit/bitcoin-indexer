@@ -20,6 +20,15 @@ pub struct Config {
     pub resources: ResourcesConfig,
     pub storage: StorageConfig,
     pub metrics: Option<MetricsConfig>,
+    pub amqp: Option<AmqpConfig>,
+}
+
+#[derive(Clone, Debug)]
+pub struct AmqpConfig {
+    pub enabled: bool,
+    pub url: String,
+    pub exchange: String,
+    pub routing_key: String,
 }
 
 #[derive(Clone, Debug)]
