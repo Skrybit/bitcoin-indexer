@@ -169,6 +169,14 @@
             prometheus_port = ${toString cfg.metrics.port}
             ''}
 
+            ${optionalString cfg.amqp.enable ''
+            [amqp]
+            enabled = true
+            url = "${cfg.amqp.url}"
+            exchange = "${cfg.amqp.exchange}"
+            routing_key = "${cfg.amqp.routingKey}"
+            ''}
+
             ${optionalString cfg.ordinals.enable ''
             ${mkDbToml "ordinals" cfg.ordinals.db}
 
@@ -271,6 +279,14 @@
             metrics = {
               enable = mkOption { type = types.bool; default = true; };
               port = mkOption { type = types.port; default = 9200; };
+            };
+
+            # ── AMQP event publishing ──
+            amqp = {
+              enable = mkOption { type = types.bool; default = false; description = "Publish block.indexed events to RabbitMQ."; };
+              url = mkOption { type = types.str; default = ""; description = "AMQP connection URL (amqp://user:pass@host:port)."; };
+              exchange = mkOption { type = types.str; default = "blockchain"; };
+              routingKey = mkOption { type = types.str; default = "block.indexed"; };
             };
 
             # ── ordinals API (Node.js) ──
