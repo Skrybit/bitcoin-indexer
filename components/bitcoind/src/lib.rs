@@ -49,6 +49,13 @@ pub enum IndexerCommand {
         apply_blocks: Vec<BitcoinBlockData>,
         rollback_block_ids: Vec<BlockIdentifier>,
     },
+    /// Record a block the pipeline was unable to process so it can be retried
+    /// manually later (via `retry-failed` CLI). See SKRYBITDEV-586.
+    RecordFailedBlock {
+        block_height: u64,
+        error_kind: String,
+        error_message: String,
+    },
     /// Terminate the indexer gracefully.
     Terminate,
 }

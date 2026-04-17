@@ -21,9 +21,30 @@ use crate::{
         wait_for_thread_finish, BlockProcessor, BlockProcessorCommand,
     },
     try_debug, try_error, try_info,
-    types::{BitcoinNetwork, BlockBytesCursor},
+    types::{BitcoinBlockData, BitcoinNetwork, BlockBytesCursor},
     utils::Context,
 };
+
+/// Message passed from BlockCompressor threads to the BlockDispatcher thread.
+/// SKRYBITDEV-586: the `Failed` variant carries error metadata so the dispatcher
+/// can forward a `RecordFailed` command to the processor, which persists the
+/// failure to the `failed_blocks` table for later retry.
+///
+/// Note: `compacted` here is the serialized bytes (`Vec<u8>`), not a
+/// `BlockBytesCursor` — the cursor is a zero-copy view that can't cross
+/// thread boundaries. The cursor is reconstructed downstream when needed.
+enum DispatcherMessage {
+    Ok {
+        block_height: u64,
+        block: Option<BitcoinBlockData>,
+        compacted: Option<Vec<u8>>,
+    },
+    Failed {
+        block_height: u64,
+        error_kind: &'static str,
+        error_message: String,
+    },
+}
 
 /// Wraps `try_download_block_bytes_with_retry` to preserve the block height
 /// through the JoinSet. On download failure, returns `(height, Err)` so the
@@ -70,7 +91,11 @@ pub(crate) async fn start_block_download_pipeline(
         block_compressor_thread_count
     );
     // Create the channel that will be used to send parsed blocks to the BlockDispatcher thread for sorting.
-    let (block_dispatcher_tx, block_dispatcher_rx) = crossbeam_channel::bounded(channel_capacity);
+    // SKRYBITDEV-586: the Option wraps DispatcherMessage; None is the termination signal.
+    let (block_dispatcher_tx, block_dispatcher_rx): (
+        crossbeam_channel::Sender<Option<DispatcherMessage>>,
+        crossbeam_channel::Receiver<Option<DispatcherMessage>>,
+    ) = crossbeam_channel::bounded(channel_capacity);
 
     let mut compressor_tx_pool = Vec::with_capacity(block_compressor_thread_count);
     let mut compressor_rx_pool = Vec::with_capacity(block_compressor_thread_count);
@@ -98,7 +123,7 @@ pub(crate) async fn start_block_download_pipeline(
                         break;
                     }
                     if let Ok(Some((block_height, block_bytes))) = rx.recv() {
-                        // Parse — on failure, send skip marker to dispatcher so the
+                        // Parse — on failure, send Failed skip marker to dispatcher so the
                         // cursor can advance past this height without stalling the pipeline.
                         // SKRYBITDEV-586: was `.expect("unable to parse block")` which
                         // panicked the thread and stuck the watermark.
@@ -109,8 +134,12 @@ pub(crate) async fn start_block_download_pipeline(
                                     moved_ctx,
                                     "BlockCompressor[{thread_index}]: parse failed for block #{block_height}, skipping. error={e}"
                                 );
-                                let _ = block_dispatcher_tx_moved
-                                    .send(Some((block_height, None, None)));
+                                let _ =
+                                    block_dispatcher_tx_moved.send(Some(DispatcherMessage::Failed {
+                                        block_height,
+                                        error_kind: "parse",
+                                        error_message: e,
+                                    }));
                                 continue;
                             }
                         };
@@ -124,8 +153,13 @@ pub(crate) async fn start_block_download_pipeline(
                                         moved_ctx,
                                         "BlockCompressor[{thread_index}]: compress failed for block #{block_height}, skipping. error={e}"
                                     );
-                                    let _ = block_dispatcher_tx_moved
-                                        .send(Some((block_height, None, None)));
+                                    let _ = block_dispatcher_tx_moved.send(Some(
+                                        DispatcherMessage::Failed {
+                                            block_height,
+                                            error_kind: "compress",
+                                            error_message: e.to_string(),
+                                        },
+                                    ));
                                     continue;
                                 }
                             }
@@ -147,8 +181,13 @@ pub(crate) async fn start_block_download_pipeline(
                                         moved_ctx,
                                         "BlockCompressor[{thread_index}]: standardize failed for block #{block_height}, skipping. error={e}"
                                     );
-                                    let _ = block_dispatcher_tx_moved
-                                        .send(Some((block_height, None, None)));
+                                    let _ = block_dispatcher_tx_moved.send(Some(
+                                        DispatcherMessage::Failed {
+                                            block_height,
+                                            error_kind: "standardize",
+                                            error_message: e,
+                                        },
+                                    ));
                                     continue;
                                 }
                             }
@@ -156,11 +195,11 @@ pub(crate) async fn start_block_download_pipeline(
                             None
                         };
 
-                        let _ = block_dispatcher_tx_moved.send(Some((
+                        let _ = block_dispatcher_tx_moved.send(Some(DispatcherMessage::Ok {
                             block_height,
-                            block_data,
-                            compressed_block,
-                        )));
+                            block: block_data,
+                            compacted: compressed_block,
+                        }));
                     }
                 }
                 try_info!(moved_ctx, "BlockCompressor[{thread_index}] thread complete");
@@ -194,13 +233,13 @@ pub(crate) async fn start_block_download_pipeline(
                 }
 
                 // Dequeue all the blocks available
-                let mut new_blocks = vec![];
+                let mut new_messages = vec![];
                 while let Ok(message) = block_dispatcher_rx.try_recv() {
                     match message {
-                        Some((block_height, block, compacted_block)) => {
-                            new_blocks.push((block_height, block, compacted_block));
+                        Some(msg) => {
+                            new_messages.push(msg);
                             // Max batch size: 10_000 blocks
-                            if new_blocks.len() >= 10_000 {
+                            if new_messages.len() >= 10_000 {
                                 break;
                             }
                         }
@@ -215,24 +254,46 @@ pub(crate) async fn start_block_download_pipeline(
                 }
 
                 // Early "continue"
-                if new_blocks.is_empty() {
+                if new_messages.is_empty() {
                     sleep(Duration::from_millis(500));
                     continue;
                 }
 
                 let mut ooo_compacted_blocks = vec![];
-                for (block_height, block_opt, compacted_block) in new_blocks.into_iter() {
-                    if let Some(block) = block_opt {
-                        inbox.insert(block_height, Some((block, compacted_block)));
-                    } else if let Some(compacted_block) = compacted_block {
-                        ooo_compacted_blocks.push((block_height, compacted_block));
-                    } else {
-                        // SKRYBITDEV-586: Skip marker. Block failed to
-                        // parse/compress/standardize in the BlockCompressor thread.
-                        // Insert a None sentinel so `inbox_cursor` can advance past
-                        // this height without stalling the pipeline. The failure
-                        // was already logged by the compressor thread.
-                        inbox.insert(block_height, None);
+                for msg in new_messages.into_iter() {
+                    match msg {
+                        DispatcherMessage::Ok {
+                            block_height,
+                            block,
+                            compacted,
+                        } => {
+                            if let Some(block) = block {
+                                inbox.insert(block_height, Some((block, compacted)));
+                            } else if let Some(compacted_block) = compacted {
+                                ooo_compacted_blocks.push((block_height, compacted_block));
+                            } else {
+                                // Neither block nor compacted — treat as skip
+                                // (shouldn't normally happen on the Ok path).
+                                inbox.insert(block_height, None);
+                            }
+                        }
+                        DispatcherMessage::Failed {
+                            block_height,
+                            error_kind,
+                            error_message,
+                        } => {
+                            // SKRYBITDEV-586: persist the failure to the DB via the
+                            // BlockProcessor. The cursor also advances past this height
+                            // (None inbox entry), unblocking downstream processing.
+                            let _ = block_processor_commands_tx.send(
+                                BlockProcessorCommand::RecordFailed {
+                                    block_height,
+                                    error_kind: error_kind.to_string(),
+                                    error_message,
+                                },
+                            );
+                            inbox.insert(block_height, None);
+                        }
                     }
                 }
 
@@ -341,12 +402,15 @@ pub(crate) async fn start_block_download_pipeline(
                     ctx,
                     "BitcoinRpc: download failed for block #{height}, skipping. error={download_err}"
                 );
-                // Send a skip marker with height so the dispatcher cursor can advance.
-                // We pick an arbitrary compressor thread since the bytes are empty.
-                let skip_msg: Option<(u64, Vec<u8>)> = Some((height, Vec::new()));
-                let _ = compressor_tx_pool[round_robin_worker_thread_index].send(skip_msg);
-                round_robin_worker_thread_index =
-                    (round_robin_worker_thread_index + 1) % block_compressor_thread_count;
+                // SKRYBITDEV-586: send Failed marker directly to dispatcher so
+                // the cursor can advance + the failure gets persisted in the
+                // `failed_blocks` table. Bypass the compressor since there's
+                // nothing to parse.
+                let _ = block_dispatcher_tx.send(Some(DispatcherMessage::Failed {
+                    block_height: height,
+                    error_kind: "download",
+                    error_message: download_err,
+                }));
                 if let Some(next_height) = block_heights.pop_front() {
                     let config = config.bitcoind.clone();
                     let ctx = ctx.clone();

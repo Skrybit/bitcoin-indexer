@@ -35,6 +35,14 @@ pub(crate) enum BlockProcessorCommand {
         compacted_blocks: Vec<(u64, Vec<u8>)>,
         blocks: Vec<BitcoinBlockData>,
     },
+    /// A block was skipped by the pipeline due to a parse/compress/standardize/download
+    /// failure. The processor forwards this to the indexer which persists it to the
+    /// `failed_blocks` table. See SKRYBITDEV-586.
+    RecordFailed {
+        block_height: u64,
+        error_kind: String,
+        error_message: String,
+    },
     Terminate,
 }
 
@@ -282,6 +290,25 @@ pub(crate) async fn block_processor_runloop(
                 compacted_blocks,
                 blocks,
             }) => (compacted_blocks, blocks),
+            Ok(BlockProcessorCommand::RecordFailed {
+                block_height,
+                error_kind,
+                error_message,
+            }) => {
+                // SKRYBITDEV-586: forward to indexer which persists to `failed_blocks` table.
+                send_indexer_command(
+                    indexer_commands_tx,
+                    IndexerCommand::RecordFailedBlock {
+                        block_height,
+                        error_kind,
+                        error_message,
+                    },
+                    abort_signal,
+                    config,
+                    ctx,
+                )?;
+                continue;
+            }
             Ok(BlockProcessorCommand::Terminate) => {
                 try_info!(ctx, "BlockProcessor received Terminate command");
                 return Ok(());

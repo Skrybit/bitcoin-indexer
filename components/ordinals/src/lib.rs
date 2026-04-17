@@ -17,7 +17,7 @@ use std::{
 };
 
 use bitcoind::{
-    start_bitcoin_indexer, try_debug, try_info, try_warn,
+    start_bitcoin_indexer, try_debug, try_error, try_info, try_warn,
     types::BlockIdentifier,
     utils::{future_block_on, Context},
     Indexer, IndexerCommand,
@@ -159,6 +159,52 @@ async fn new_ordinals_indexer_runloop(
                                     garbage_collect_nth_block = 0;
                                 }
                             }
+                            IndexerCommand::RecordFailedBlock {
+                                block_height,
+                                error_kind,
+                                error_message,
+                            } => {
+                                // SKRYBITDEV-586: persist the skipped block to the
+                                // `failed_blocks` table so it can be retried manually
+                                // later via `bitcoin-indexer ordinals retry-failed`.
+                                let ord_client = pg_pool_client(&pg_pools_moved.ordinals).await?;
+                                if let Err(e) = db::ordinals_pg::record_failed_block(
+                                    &ord_client,
+                                    block_height,
+                                    &error_kind,
+                                    &error_message,
+                                )
+                                .await
+                                {
+                                    try_error!(
+                                        ctx_moved,
+                                        "Unable to persist failed block #{block_height}: {e}"
+                                    );
+                                }
+
+                                // SKRYBITDEV-586: bump per-kind error counter.
+                                match error_kind.as_str() {
+                                    "parse" => prometheus_moved.block_parse_errors_total.inc(),
+                                    "compress" => {
+                                        prometheus_moved.block_compress_errors_total.inc()
+                                    }
+                                    "standardize" => {
+                                        prometheus_moved.block_standardize_errors_total.inc()
+                                    }
+                                    "download" => {
+                                        prometheus_moved.block_download_errors_total.inc()
+                                    }
+                                    _ => {}
+                                }
+
+                                // SKRYBITDEV-586: refresh pending count gauge.
+                                if let Ok(count) =
+                                    db::ordinals_pg::count_unresolved_failed_blocks(&ord_client)
+                                        .await
+                                {
+                                    prometheus_moved.failed_blocks_pending.set(count as u64);
+                                }
+                            }
                             IndexerCommand::Terminate => {
                                 break;
                             }
@@ -217,6 +263,16 @@ pub async fn get_chain_tip(config: &Config) -> Result<BlockIdentifier, String> {
     let pool = pg_pool(&config.ordinals.as_ref().unwrap().db)?;
     let ord_client = pg_pool_client(&pool).await?;
     Ok(db::ordinals_pg::get_chain_tip(&ord_client).await?.unwrap())
+}
+
+/// SKRYBITDEV-586: Public wrapper around
+/// [`db::ordinals_pg::list_unresolved_failed_blocks`] for CLI consumers.
+pub async fn list_unresolved_failed_blocks(
+    config: &Config,
+) -> Result<Vec<db::ordinals_pg::FailedBlock>, String> {
+    let pools = pg_pools(config);
+    let client = pg_pool_client(&pools.ordinals).await?;
+    db::ordinals_pg::list_unresolved_failed_blocks(&client).await
 }
 
 pub async fn rollback_block_range(

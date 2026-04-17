@@ -95,6 +95,14 @@ pub enum IndexCommand {
     /// Rollback index blocks
     #[clap(name = "rollback", bin_name = "drop")]
     Rollback(RollbackIndexCommand),
+    /// Re-process every block in the `failed_blocks` table with
+    /// `resolved_at IS NULL`. Marks rows as resolved on success. See SKRYBITDEV-586.
+    #[clap(name = "retry-failed", bin_name = "retry-failed")]
+    RetryFailed(RetryFailedCommand),
+    /// Re-process a specific block range without affecting the main watermark.
+    /// Useful to patch up specific blocks after an indexer fix. See SKRYBITDEV-586.
+    #[clap(name = "sync-range", bin_name = "sync-range")]
+    SyncRange(SyncRangeCommand),
 }
 
 #[derive(Parser, PartialEq, Clone, Debug)]
@@ -107,6 +115,24 @@ pub struct SyncIndexCommand {
 pub struct RollbackIndexCommand {
     /// Number of blocks to rollback from index tip
     pub blocks: u32,
+    #[clap(long = "config-path")]
+    pub config_path: String,
+}
+
+#[derive(Parser, PartialEq, Clone, Debug)]
+pub struct RetryFailedCommand {
+    #[clap(long = "config-path")]
+    pub config_path: String,
+}
+
+#[derive(Parser, PartialEq, Clone, Debug)]
+pub struct SyncRangeCommand {
+    /// First block in the range (inclusive).
+    #[clap(long = "from-block")]
+    pub from_block: u64,
+    /// Last block in the range (inclusive).
+    #[clap(long = "to-block")]
+    pub to_block: u64,
     #[clap(long = "config-path")]
     pub config_path: String,
 }

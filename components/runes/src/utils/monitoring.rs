@@ -42,6 +42,13 @@ pub struct PrometheusMonitoring {
     pub runes_cenotaph_mint_operations_per_block: UInt64Gauge,
     pub runes_etching_inputs_checked_per_block: UInt64Gauge,
 
+    // SKRYBITDEV-586: Pipeline error counters. See ordinals monitoring for rationale.
+    pub block_parse_errors_total: UInt64Gauge,
+    pub block_compress_errors_total: UInt64Gauge,
+    pub block_standardize_errors_total: UInt64Gauge,
+    pub block_download_errors_total: UInt64Gauge,
+    pub failed_blocks_pending: UInt64Gauge,
+
     // Registry
     pub registry: Registry,
 }
@@ -144,6 +151,33 @@ impl PrometheusMonitoring {
             "Number of inputs checked for rune commitment per block",
         );
 
+        // SKRYBITDEV-586: pipeline error counters.
+        let block_parse_errors_total = Self::create_and_register_uint64_gauge(
+            &registry,
+            "block_parse_errors_total",
+            "Count of blocks that failed bitcoind RPC JSON parse in the runes pipeline.",
+        );
+        let block_compress_errors_total = Self::create_and_register_uint64_gauge(
+            &registry,
+            "block_compress_errors_total",
+            "Count of blocks that failed compression in the runes pipeline.",
+        );
+        let block_standardize_errors_total = Self::create_and_register_uint64_gauge(
+            &registry,
+            "block_standardize_errors_total",
+            "Count of blocks that failed standardization in the runes pipeline.",
+        );
+        let block_download_errors_total = Self::create_and_register_uint64_gauge(
+            &registry,
+            "block_download_errors_total",
+            "Count of blocks the runes pipeline was unable to download from bitcoind.",
+        );
+        let failed_blocks_pending = Self::create_and_register_uint64_gauge(
+            &registry,
+            "failed_blocks_pending",
+            "Number of rows in the runes `failed_blocks` table with resolved_at IS NULL.",
+        );
+
         PrometheusMonitoring {
             last_indexed_block_height,
             last_indexed_rune_number,
@@ -159,6 +193,11 @@ impl PrometheusMonitoring {
             runes_cenotaph_etching_operations_per_block,
             runes_cenotaph_mint_operations_per_block,
             runes_etching_inputs_checked_per_block,
+            block_parse_errors_total,
+            block_compress_errors_total,
+            block_standardize_errors_total,
+            block_download_errors_total,
+            failed_blocks_pending,
             registry,
         }
     }
