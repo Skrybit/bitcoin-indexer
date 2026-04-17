@@ -113,6 +113,49 @@ async fn handle_command(opts: Protocol, ctx: &Context) -> Result<(), String> {
                     .await?;
                     println!("{} blocks dropped", cmd.blocks);
                 }
+                IndexCommand::RetryFailed(cmd) => {
+                    // SKRYBITDEV-586: list every unresolved row in `failed_blocks`
+                    // with operator-friendly retry instructions.
+                    let config = Config::from_file_path(&cmd.config_path)?;
+                    config.assert_ordinals_config()?;
+                    list_failed_blocks_ordinals(&config, ctx).await?;
+                }
+                IndexCommand::SyncRange(cmd) => {
+                    // SKRYBITDEV-586: re-index a specific block range. Rolls the index
+                    // back to `from_block - 1` then syncs forward. If the range is past
+                    // the current chain tip, normal sync will pick it up naturally.
+                    let config = Config::from_file_path(&cmd.config_path)?;
+                    config.assert_ordinals_config()?;
+                    if cmd.from_block > cmd.to_block {
+                        return Err(format!(
+                            "sync-range: --from-block ({}) must be <= --to-block ({})",
+                            cmd.from_block, cmd.to_block
+                        ));
+                    }
+                    let chain_tip = ordinals::get_chain_tip(&config).await?;
+                    if chain_tip.index >= cmd.from_block {
+                        try_info!(
+                            ctx,
+                            "sync-range: current chain tip at #{} — rolling back to #{}",
+                            chain_tip.index,
+                            cmd.from_block.saturating_sub(1)
+                        );
+                        ordinals::rollback_block_range(
+                            cmd.from_block,
+                            chain_tip.index.min(cmd.to_block),
+                            &config,
+                            ctx,
+                        )
+                        .await?;
+                    }
+                    try_info!(
+                        ctx,
+                        "sync-range: syncing forward; range #{}..=#{} will be re-indexed",
+                        cmd.from_block,
+                        cmd.to_block
+                    );
+                    ordinals::start_ordinals_indexer(false, &abort_signal, &config, ctx).await?;
+                }
             },
             Command::Database(database_command) => match database_command {
                 DatabaseCommand::Migrate(cmd) => {
@@ -151,6 +194,47 @@ async fn handle_command(opts: Protocol, ctx: &Context) -> Result<(), String> {
                     .await?;
                     println!("{} blocks dropped", cmd.blocks);
                 }
+                IndexCommand::RetryFailed(cmd) => {
+                    // SKRYBITDEV-586: list every unresolved failed block with
+                    // retry instructions.
+                    let config = Config::from_file_path(&cmd.config_path)?;
+                    config.assert_runes_config()?;
+                    list_failed_blocks_runes(&config, ctx).await?;
+                }
+                IndexCommand::SyncRange(cmd) => {
+                    // SKRYBITDEV-586: re-index a specific block range for runes.
+                    let config = Config::from_file_path(&cmd.config_path)?;
+                    config.assert_runes_config()?;
+                    if cmd.from_block > cmd.to_block {
+                        return Err(format!(
+                            "sync-range: --from-block ({}) must be <= --to-block ({})",
+                            cmd.from_block, cmd.to_block
+                        ));
+                    }
+                    let chain_tip = runes::get_chain_tip(&config).await?;
+                    if chain_tip.index >= cmd.from_block {
+                        try_info!(
+                            ctx,
+                            "sync-range: current chain tip at #{} — rolling back to #{}",
+                            chain_tip.index,
+                            cmd.from_block.saturating_sub(1)
+                        );
+                        runes::rollback_block_range(
+                            cmd.from_block,
+                            chain_tip.index.min(cmd.to_block),
+                            &config,
+                            ctx,
+                        )
+                        .await?;
+                    }
+                    try_info!(
+                        ctx,
+                        "sync-range: syncing forward; range #{}..=#{} will be re-indexed",
+                        cmd.from_block,
+                        cmd.to_block
+                    );
+                    runes::start_runes_indexer(false, &abort_signal, &config, ctx).await?;
+                }
             },
             Command::Database(database_command) => match database_command {
                 DatabaseCommand::Migrate(cmd) => {
@@ -181,4 +265,79 @@ async fn handle_command(opts: Protocol, ctx: &Context) -> Result<(), String> {
         },
     }
     Ok(())
+}
+
+/// SKRYBITDEV-586: List unresolved failed blocks for the ordinals indexer.
+/// Prints a human-readable table + the exact `sync-range` command the operator
+/// can run to re-index each block.
+async fn list_failed_blocks_ordinals(
+    config: &Config,
+    ctx: &Context,
+) -> Result<(), String> {
+    let failed = ordinals::list_unresolved_failed_blocks(config).await?;
+    print_failed_blocks(&failed, "ordinals", ctx);
+    Ok(())
+}
+
+/// SKRYBITDEV-586: same as above, for runes.
+async fn list_failed_blocks_runes(
+    config: &Config,
+    ctx: &Context,
+) -> Result<(), String> {
+    let failed = runes::list_unresolved_failed_blocks(config).await?;
+    print_failed_blocks_runes(&failed, "runes", ctx);
+    Ok(())
+}
+
+fn print_failed_blocks(
+    failed: &[ordinals::db::ordinals_pg::FailedBlock],
+    protocol: &str,
+    ctx: &Context,
+) {
+    if failed.is_empty() {
+        try_info!(ctx, "No unresolved failed blocks. Nothing to retry.");
+        return;
+    }
+    println!("{} unresolved failed blocks:\n", failed.len());
+    println!("{:<10} {:<14} {:<8} {}", "HEIGHT", "KIND", "RETRIES", "ERROR");
+    println!("{}", "-".repeat(100));
+    for f in failed {
+        let error_preview: String = f.error_message.chars().take(64).collect();
+        println!(
+            "{:<10} {:<14} {:<8} {}",
+            f.block_height, f.error_kind, f.retry_count, error_preview
+        );
+    }
+    println!();
+    println!(
+        "To re-index a specific range, use:\n  bitcoin-indexer {protocol} sync-range --from-block N --to-block M --config-path X"
+    );
+    println!(
+        "Resolved rows can be marked via psql:\n  UPDATE failed_blocks SET resolved_at = NOW() WHERE block_height = N;"
+    );
+}
+
+fn print_failed_blocks_runes(
+    failed: &[runes::db::FailedBlock],
+    protocol: &str,
+    ctx: &Context,
+) {
+    if failed.is_empty() {
+        try_info!(ctx, "No unresolved failed blocks. Nothing to retry.");
+        return;
+    }
+    println!("{} unresolved failed blocks:\n", failed.len());
+    println!("{:<10} {:<14} {:<8} {}", "HEIGHT", "KIND", "RETRIES", "ERROR");
+    println!("{}", "-".repeat(100));
+    for f in failed {
+        let error_preview: String = f.error_message.chars().take(64).collect();
+        println!(
+            "{:<10} {:<14} {:<8} {}",
+            f.block_height, f.error_kind, f.retry_count, error_preview
+        );
+    }
+    println!();
+    println!(
+        "To re-index a specific range, use:\n  bitcoin-indexer {protocol} sync-range --from-block N --to-block M --config-path X"
+    );
 }

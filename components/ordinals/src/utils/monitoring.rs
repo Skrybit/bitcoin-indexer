@@ -53,6 +53,16 @@ pub struct PrometheusMonitoring {
     pub brc20_transfer_operations_total: UInt64Gauge,
     pub brc20_transfer_send_operations_total: UInt64Gauge,
 
+    // SKRYBITDEV-586: Pipeline error counters. Each is bumped when the
+    // BlockProcessor receives an IndexerCommand::RecordFailedBlock with the
+    // matching error_kind. `failed_blocks_pending` is the unresolved count
+    // from the `failed_blocks` table, refreshed on each failure event.
+    pub block_parse_errors_total: UInt64Gauge,
+    pub block_compress_errors_total: UInt64Gauge,
+    pub block_standardize_errors_total: UInt64Gauge,
+    pub block_download_errors_total: UInt64Gauge,
+    pub failed_blocks_pending: UInt64Gauge,
+
     // Registry
     pub registry: Registry,
 }
@@ -182,6 +192,33 @@ impl PrometheusMonitoring {
             "Count of BRC-20 transfer send operations processed in total",
         );
 
+        // SKRYBITDEV-586: pipeline error counters.
+        let block_parse_errors_total = Self::create_and_register_uint64_gauge(
+            &registry,
+            "block_parse_errors_total",
+            "Count of blocks that failed bitcoind RPC JSON parse in the pipeline (skipped + logged).",
+        );
+        let block_compress_errors_total = Self::create_and_register_uint64_gauge(
+            &registry,
+            "block_compress_errors_total",
+            "Count of blocks that failed compression in the pipeline (skipped + logged).",
+        );
+        let block_standardize_errors_total = Self::create_and_register_uint64_gauge(
+            &registry,
+            "block_standardize_errors_total",
+            "Count of blocks that failed standardization in the pipeline (skipped + logged).",
+        );
+        let block_download_errors_total = Self::create_and_register_uint64_gauge(
+            &registry,
+            "block_download_errors_total",
+            "Count of blocks the pipeline was unable to download from bitcoind (skipped + logged).",
+        );
+        let failed_blocks_pending = Self::create_and_register_uint64_gauge(
+            &registry,
+            "failed_blocks_pending",
+            "Number of rows in the `failed_blocks` table with resolved_at IS NULL.",
+        );
+
         PrometheusMonitoring {
             last_indexed_block_height,
             last_indexed_inscription_number,
@@ -201,6 +238,11 @@ impl PrometheusMonitoring {
             brc20_mint_operations_total,
             brc20_transfer_operations_total,
             brc20_transfer_send_operations_total,
+            block_parse_errors_total,
+            block_compress_errors_total,
+            block_standardize_errors_total,
+            block_download_errors_total,
+            failed_blocks_pending,
             registry,
         }
     }

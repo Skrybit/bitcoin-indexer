@@ -70,6 +70,104 @@ pub async fn get_chain_tip_block_height<T: GenericClient>(
     Ok(max.map(|v| v.0))
 }
 
+/// A block that the indexer pipeline was unable to process. See SKRYBITDEV-586.
+#[derive(Clone, Debug)]
+pub struct FailedBlock {
+    pub block_height: u64,
+    pub error_kind: String,
+    pub error_message: String,
+    pub retry_count: i32,
+}
+
+/// Record a failed block (or bump `retry_count` + update error info if already recorded).
+/// Uses ON CONFLICT so the skip-and-log code path from the BlockCompressor can safely
+/// call this repeatedly without leaking duplicate rows. See SKRYBITDEV-586.
+pub async fn record_failed_block<T: GenericClient>(
+    client: &T,
+    block_height: u64,
+    error_kind: &str,
+    error_message: &str,
+) -> Result<(), String> {
+    client
+        .execute(
+            "INSERT INTO failed_blocks (block_height, error_kind, error_message)
+             VALUES ($1, $2, $3)
+             ON CONFLICT (block_height) DO UPDATE SET
+                 error_kind = EXCLUDED.error_kind,
+                 error_message = EXCLUDED.error_message,
+                 last_attempt_at = NOW(),
+                 retry_count = failed_blocks.retry_count + 1,
+                 resolved_at = NULL",
+            &[
+                &PgNumericU64(block_height),
+                &error_kind,
+                &error_message,
+            ],
+        )
+        .await
+        .map_err(|e| format!("record_failed_block: {e}"))?;
+    Ok(())
+}
+
+/// List unresolved failed blocks, ordered by block_height ascending. Used by the
+/// `retry-failed` CLI. See SKRYBITDEV-586.
+pub async fn list_unresolved_failed_blocks<T: GenericClient>(
+    client: &T,
+) -> Result<Vec<FailedBlock>, String> {
+    let rows = client
+        .query(
+            "SELECT block_height, error_kind, error_message, retry_count
+             FROM failed_blocks
+             WHERE resolved_at IS NULL
+             ORDER BY block_height ASC",
+            &[],
+        )
+        .await
+        .map_err(|e| format!("list_unresolved_failed_blocks: {e}"))?;
+    let mut result = Vec::with_capacity(rows.len());
+    for row in rows {
+        let height: PgNumericU64 = row.get("block_height");
+        result.push(FailedBlock {
+            block_height: height.0,
+            error_kind: row.get("error_kind"),
+            error_message: row.get("error_message"),
+            retry_count: row.get("retry_count"),
+        });
+    }
+    Ok(result)
+}
+
+/// Count of unresolved failed blocks. Used by the Prometheus `failed_blocks_pending`
+/// gauge. See SKRYBITDEV-586.
+pub async fn count_unresolved_failed_blocks<T: GenericClient>(
+    client: &T,
+) -> Result<i64, String> {
+    let row = client
+        .query_one(
+            "SELECT COUNT(*)::BIGINT AS c FROM failed_blocks WHERE resolved_at IS NULL",
+            &[],
+        )
+        .await
+        .map_err(|e| format!("count_unresolved_failed_blocks: {e}"))?;
+    Ok(row.get("c"))
+}
+
+/// Mark a previously-failed block as resolved (successfully reprocessed).
+/// Used by the `retry-failed` CLI. See SKRYBITDEV-586.
+pub async fn mark_block_resolved<T: GenericClient>(
+    client: &T,
+    block_height: u64,
+) -> Result<(), String> {
+    client
+        .execute(
+            "UPDATE failed_blocks SET resolved_at = NOW() WHERE block_height = $1",
+            &[&PgNumericU64(block_height)],
+        )
+        .await
+        .map_err(|e| format!("mark_block_resolved: {e}"))?;
+    Ok(())
+}
+
 pub async fn get_highest_inscription_number<T: GenericClient>(
     client: &T,
 ) -> Result<Option<i64>, String> {

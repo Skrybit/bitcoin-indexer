@@ -89,6 +89,50 @@ async fn new_runes_indexer_runloop(
                                     .await?;
                                 }
                             }
+                            IndexerCommand::RecordFailedBlock {
+                                block_height,
+                                error_kind,
+                                error_message,
+                            } => {
+                                // SKRYBITDEV-586: persist to `failed_blocks` so the block
+                                // can be retried manually via `bitcoin-indexer runes retry-failed`.
+                                let pg_client = pg_pool_client(&pg_pool_moved).await?;
+                                if let Err(e) = db::record_failed_block(
+                                    &pg_client,
+                                    block_height,
+                                    &error_kind,
+                                    &error_message,
+                                )
+                                .await
+                                {
+                                    try_error!(
+                                        ctx_moved,
+                                        "Unable to persist failed rune block #{block_height}: {e}"
+                                    );
+                                }
+
+                                // SKRYBITDEV-586: bump per-kind error counter.
+                                match error_kind.as_str() {
+                                    "parse" => prometheus_moved.block_parse_errors_total.inc(),
+                                    "compress" => {
+                                        prometheus_moved.block_compress_errors_total.inc()
+                                    }
+                                    "standardize" => {
+                                        prometheus_moved.block_standardize_errors_total.inc()
+                                    }
+                                    "download" => {
+                                        prometheus_moved.block_download_errors_total.inc()
+                                    }
+                                    _ => {}
+                                }
+
+                                // SKRYBITDEV-586: refresh pending count gauge.
+                                if let Ok(count) =
+                                    db::count_unresolved_failed_blocks(&pg_client).await
+                                {
+                                    prometheus_moved.failed_blocks_pending.set(count as u64);
+                                }
+                            }
                             IndexerCommand::Terminate => {
                                 break;
                             }
@@ -141,6 +185,16 @@ pub async fn rollback_block_range(
         roll_back_block(&mut pg_client, block_id, ctx).await;
     }
     Ok(())
+}
+
+/// SKRYBITDEV-586: Public wrapper around [`db::list_unresolved_failed_blocks`]
+/// for CLI consumers.
+pub async fn list_unresolved_failed_blocks(
+    config: &Config,
+) -> Result<Vec<db::FailedBlock>, String> {
+    let pool = pg_pool(&config.runes.as_ref().unwrap().db)?;
+    let pg_client = pg_pool_client(&pool).await?;
+    db::list_unresolved_failed_blocks(&pg_client).await
 }
 
 /// Starts the runes indexing process. Will block the main thread indefinitely until explicitly stopped or it reaches chain tip
