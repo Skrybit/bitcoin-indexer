@@ -6,7 +6,6 @@ use bitcoincore_rpc::{
     bitcoin::{self, hashes::Hash, Amount, BlockHash},
     jsonrpc::error::RpcError,
 };
-use bitcoincore_rpc_json::GetRawTransactionResultVoutScriptPubKey;
 use config::BitcoindConfig;
 use hiro_system_kit::slog;
 use reqwest::Client as HttpClient;
@@ -112,7 +111,25 @@ pub(crate) struct BitcoinTransactionOutputFullBreakdown {
     #[serde(with = "bitcoin::amount::serde::as_btc")]
     pub value: Amount,
     pub n: u32,
-    pub script_pub_key: GetRawTransactionResultVoutScriptPubKey,
+    pub script_pub_key: ScriptPubKeyHex,
+}
+
+/// Permissive deserializer for the `scriptPubKey` object in `getblock` verbosity 3 responses.
+///
+/// Upstream `GetRawTransactionResultVoutScriptPubKey` uses a strongly-typed `ScriptPubkeyType`
+/// enum whose variants must match the `type` field exactly. Bitcoin Core adds new script
+/// type variants over time (e.g., `anchor` in 28.x for BIP-431 ephemeral anchor outputs)
+/// which cause deserialization panics across the entire block.
+///
+/// This struct only consumes the `hex` field (the only field `standardize_bitcoin_block`
+/// actually uses) and catches all other fields via `#[serde(flatten)]` into a `Value` that
+/// is never inspected. This makes the indexer immune to any future unknown script type
+/// variants. See SKRYBITDEV-587.
+#[derive(Clone, PartialEq, Debug, Deserialize, Serialize)]
+pub(crate) struct ScriptPubKeyHex {
+    pub hex: String,
+    #[serde(flatten, skip_serializing)]
+    _other: serde_json::Value,
 }
 
 #[derive(Deserialize, Serialize)]
