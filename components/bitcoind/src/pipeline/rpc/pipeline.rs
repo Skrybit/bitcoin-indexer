@@ -20,10 +20,24 @@ use crate::{
         },
         wait_for_thread_finish, BlockProcessor, BlockProcessorCommand,
     },
-    try_debug, try_info,
+    try_debug, try_error, try_info,
     types::{BitcoinNetwork, BlockBytesCursor},
     utils::Context,
 };
+
+/// Wraps `try_download_block_bytes_with_retry` to preserve the block height
+/// through the JoinSet. On download failure, returns `(height, Err)` so the
+/// orchestrator can skip-and-log instead of panicking.
+async fn download_block_tagged(
+    http_client: reqwest::Client,
+    block_height: u64,
+    bitcoin_config: config::BitcoindConfig,
+    ctx: Context,
+) -> (u64, Result<Vec<u8>, String>) {
+    let result =
+        try_download_block_bytes_with_retry(http_client, block_height, bitcoin_config, ctx).await;
+    (block_height, result)
+}
 
 /// Downloads historical blocks from bitcoind's RPC interface and pushes them to a [BlockProcessor] so they can be indexed
 /// or ingested as needed.
@@ -62,7 +76,11 @@ pub(crate) async fn start_block_download_pipeline(
     let mut compressor_rx_pool = Vec::with_capacity(block_compressor_thread_count);
     let mut compressor_handles = Vec::with_capacity(block_compressor_thread_count);
     for _ in 0..block_compressor_thread_count {
-        let (tx, rx) = bounded::<Option<Vec<u8>>>(channel_capacity);
+        // Channel message: Option<(block_height, block_bytes)>.
+        // Height is tagged here so that on parse failure the BlockCompressor
+        // can report the failed block height to the dispatcher (skip marker)
+        // without having to parse the bytes first (chicken/egg otherwise).
+        let (tx, rx) = bounded::<Option<(u64, Vec<u8>)>>(channel_capacity);
         compressor_tx_pool.push(tx);
         compressor_rx_pool.push(rx);
     }
@@ -79,29 +97,65 @@ pub(crate) async fn start_block_download_pipeline(
                     if cloned_abort_signal.load(Ordering::SeqCst) {
                         break;
                     }
-                    if let Ok(Some(block_bytes)) = rx.recv() {
-                        let raw_block_data =
-                            parse_downloaded_block(block_bytes).expect("unable to parse block");
+                    if let Ok(Some((block_height, block_bytes))) = rx.recv() {
+                        // Parse — on failure, send skip marker to dispatcher so the
+                        // cursor can advance past this height without stalling the pipeline.
+                        // SKRYBITDEV-586: was `.expect("unable to parse block")` which
+                        // panicked the thread and stuck the watermark.
+                        let raw_block_data = match parse_downloaded_block(block_bytes) {
+                            Ok(data) => data,
+                            Err(e) => {
+                                try_error!(
+                                    moved_ctx,
+                                    "BlockCompressor[{thread_index}]: parse failed for block #{block_height}, skipping. error={e}"
+                                );
+                                let _ = block_dispatcher_tx_moved
+                                    .send(Some((block_height, None, None)));
+                                continue;
+                            }
+                        };
+
+                        // Compress — on failure, same skip-and-log behavior.
                         let compressed_block = if compress_blocks {
-                            Some(
-                                BlockBytesCursor::from_full_block(&raw_block_data)
-                                    .expect("unable to compress block"),
-                            )
+                            match BlockBytesCursor::from_full_block(&raw_block_data) {
+                                Ok(c) => Some(c),
+                                Err(e) => {
+                                    try_error!(
+                                        moved_ctx,
+                                        "BlockCompressor[{thread_index}]: compress failed for block #{block_height}, skipping. error={e}"
+                                    );
+                                    let _ = block_dispatcher_tx_moved
+                                        .send(Some((block_height, None, None)));
+                                    continue;
+                                }
+                            }
                         } else {
                             None
                         };
-                        let block_height = raw_block_data.height as u64;
+
+                        // Standardize (only for blocks >= start_sequencing_blocks_at_height) —
+                        // on failure, same skip-and-log behavior.
                         let block_data = if block_height >= start_sequencing_blocks_at_height {
-                            let block = standardize_bitcoin_block(
+                            match standardize_bitcoin_block(
                                 raw_block_data,
                                 &BitcoinNetwork::from_network(moved_bitcoin_network),
                                 &moved_ctx,
-                            )
-                            .expect("unable to deserialize block");
-                            Some(block)
+                            ) {
+                                Ok(block) => Some(block),
+                                Err((e, _fatal)) => {
+                                    try_error!(
+                                        moved_ctx,
+                                        "BlockCompressor[{thread_index}]: standardize failed for block #{block_height}, skipping. error={e}"
+                                    );
+                                    let _ = block_dispatcher_tx_moved
+                                        .send(Some((block_height, None, None)));
+                                    continue;
+                                }
+                            }
                         } else {
                             None
                         };
+
                         let _ = block_dispatcher_tx_moved.send(Some((
                             block_height,
                             block_data,
@@ -169,9 +223,16 @@ pub(crate) async fn start_block_download_pipeline(
                 let mut ooo_compacted_blocks = vec![];
                 for (block_height, block_opt, compacted_block) in new_blocks.into_iter() {
                     if let Some(block) = block_opt {
-                        inbox.insert(block_height, (block, compacted_block));
+                        inbox.insert(block_height, Some((block, compacted_block)));
                     } else if let Some(compacted_block) = compacted_block {
                         ooo_compacted_blocks.push((block_height, compacted_block));
+                    } else {
+                        // SKRYBITDEV-586: Skip marker. Block failed to
+                        // parse/compress/standardize in the BlockCompressor thread.
+                        // Insert a None sentinel so `inbox_cursor` can advance past
+                        // this height without stalling the pipeline. The failure
+                        // was already logged by the compressor thread.
+                        inbox.insert(block_height, None);
                     }
                 }
 
@@ -192,15 +253,21 @@ pub(crate) async fn start_block_download_pipeline(
                 // In order processing: construct the longest sequence of known blocks
                 let mut compacted_blocks = vec![];
                 let mut blocks = vec![];
-                while let Some((block, compacted_block)) = inbox.remove(&inbox_cursor) {
-                    if let Some(compacted_block) = compacted_block {
-                        compacted_blocks.push((inbox_cursor, compacted_block));
+                while let Some(entry) = inbox.remove(&inbox_cursor) {
+                    if let Some((block, compacted_block)) = entry {
+                        if let Some(compacted_block) = compacted_block {
+                            compacted_blocks.push((inbox_cursor, compacted_block));
+                        }
+                        blocks.push(block);
                     }
-                    blocks.push(block);
+                    // SKRYBITDEV-586: if entry is None (skip marker), we simply
+                    // advance the cursor without pushing anything to the processor.
+                    // The failure was already logged; the pipeline continues.
+                    // Count toward blocks_processed so the loop termination condition
+                    // (blocks_processed == number_of_blocks_to_process) can still be reached.
+                    blocks_processed += 1;
                     inbox_cursor += 1;
                 }
-
-                blocks_processed += blocks.len() as u64;
 
                 if !blocks.is_empty() {
                     let _ =
@@ -235,12 +302,7 @@ pub(crate) async fn start_block_download_pipeline(
             let rpc_client = rpc_client.clone();
             // We interleave the initial requests to avoid DDOSing bitcoind from the get go.
             sleep(Duration::from_millis(500));
-            rpc_handles.spawn(try_download_block_bytes_with_retry(
-                rpc_client,
-                block_height,
-                config,
-                ctx,
-            ));
+            rpc_handles.spawn(download_block_tagged(rpc_client, block_height, config, ctx));
         }
     }
     // As soon as we receive block bytes from bitcoind's RPC interface via any of the BitcoinRpc threads, we send them to the
@@ -250,15 +312,60 @@ pub(crate) async fn start_block_download_pipeline(
         if abort_signal.load(Ordering::SeqCst) {
             break;
         }
-        let block = res
-            .expect("unable to retrieve block")
-            .expect("unable to deserialize block");
+
+        // SKRYBITDEV-586: handle download failures gracefully. JoinSet task may
+        // itself have failed (join error) OR the download function returned Err.
+        // In either case, we log and send a skip marker downstream so the pipeline
+        // can advance past this height without stalling.
+        let (block_height, block_bytes) = match res {
+            Err(join_err) => {
+                try_error!(
+                    ctx,
+                    "BitcoinRpc: download task panicked/cancelled, cannot identify block height. error={join_err}"
+                );
+                // We don't know which block_height this was; we can't emit a skip marker.
+                // The BlockDispatcher will eventually time out when inbox_cursor exceeds
+                // end_block_height. Try to queue the next block so the pipeline continues.
+                if let Some(next_height) = block_heights.pop_front() {
+                    let config = config.bitcoind.clone();
+                    let ctx = ctx.clone();
+                    let rpc_client = rpc_client.clone();
+                    rpc_handles.spawn(download_block_tagged(
+                        rpc_client, next_height, config, ctx,
+                    ));
+                }
+                continue;
+            }
+            Ok((height, Err(download_err))) => {
+                try_error!(
+                    ctx,
+                    "BitcoinRpc: download failed for block #{height}, skipping. error={download_err}"
+                );
+                // Send a skip marker with height so the dispatcher cursor can advance.
+                // We pick an arbitrary compressor thread since the bytes are empty.
+                let skip_msg: Option<(u64, Vec<u8>)> = Some((height, Vec::new()));
+                let _ = compressor_tx_pool[round_robin_worker_thread_index].send(skip_msg);
+                round_robin_worker_thread_index =
+                    (round_robin_worker_thread_index + 1) % block_compressor_thread_count;
+                if let Some(next_height) = block_heights.pop_front() {
+                    let config = config.bitcoind.clone();
+                    let ctx = ctx.clone();
+                    let rpc_client = rpc_client.clone();
+                    rpc_handles.spawn(download_block_tagged(
+                        rpc_client, next_height, config, ctx,
+                    ));
+                }
+                continue;
+            }
+            Ok((height, Ok(bytes))) => (height, bytes),
+        };
 
         loop {
             if abort_signal.load(Ordering::SeqCst) {
                 break;
             }
-            let res = compressor_tx_pool[round_robin_worker_thread_index].send(Some(block.clone()));
+            let res = compressor_tx_pool[round_robin_worker_thread_index]
+                .send(Some((block_height, block_bytes.clone())));
             round_robin_worker_thread_index =
                 (round_robin_worker_thread_index + 1) % block_compressor_thread_count;
             if res.is_ok() {
@@ -271,12 +378,7 @@ pub(crate) async fn start_block_download_pipeline(
             let config = config.bitcoind.clone();
             let ctx = ctx.clone();
             let rpc_client = rpc_client.clone();
-            rpc_handles.spawn(try_download_block_bytes_with_retry(
-                rpc_client,
-                block_height,
-                config,
-                ctx,
-            ));
+            rpc_handles.spawn(download_block_tagged(rpc_client, block_height, config, ctx));
         }
     }
 
