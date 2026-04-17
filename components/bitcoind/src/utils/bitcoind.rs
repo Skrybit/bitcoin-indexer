@@ -2,42 +2,56 @@ use std::{thread::sleep, time::Duration};
 
 use bitcoincore_rpc::{
     bitcoin::{BlockHash, Txid},
-    Auth, Client, RpcApi,
+    Client, RpcApi,
 };
 use bitcoincore_rpc_json::GetRawTransactionResult;
 use config::BitcoindConfig;
+use jsonrpc::http::simple_http::SimpleHttpTransport;
 
 use crate::{try_error, try_info, types::BlockIdentifier, utils::Context};
 
+/// Build a bitcoind RPC client using jsonrpc's `simple_http` transport.
+///
+/// We bypass `Client::new()` (which uses jsonrpc's `minreq_http` transport
+/// under bitcoincore-rpc 0.19) because minreq's auth handling against
+/// bitcoind's RPC is unreliable. `simple_http` is the hand-written HTTP/1.0
+/// transport that worked in jsonrpc 0.14/0.18 and is what 0.18 used by default.
+/// See SKRYBITDEV-588.
 pub fn bitcoind_get_client(config: &BitcoindConfig, ctx: &Context) -> Client {
     loop {
-        let auth = Auth::UserPass(config.rpc_username.clone(), config.rpc_password.clone());
-        match Client::new(&config.rpc_url, auth) {
-            Ok(con) => {
-                return con;
-            }
+        match build_client(config) {
+            Ok(con) => return con,
             Err(e) => {
-                try_error!(ctx, "bitcoind: Unable to get client: {}", e.to_string());
+                try_error!(ctx, "bitcoind: Unable to get client: {}", e);
                 sleep(Duration::from_secs(1));
             }
         }
     }
 }
 
+fn build_client(config: &BitcoindConfig) -> Result<Client, String> {
+    let transport = SimpleHttpTransport::builder()
+        .url(&config.rpc_url)
+        .map_err(|e| format!("invalid rpc_url '{}': {}", config.rpc_url, e))?
+        .auth(
+            config.rpc_username.clone(),
+            Some(config.rpc_password.clone()),
+        )
+        .timeout(Duration::from_secs(30))
+        .build();
+    let jsonrpc_client = jsonrpc::client::Client::with_transport(transport);
+    Ok(Client::from_jsonrpc(jsonrpc_client))
+}
+
 /// Retrieves the chain tip from bitcoind.
-/// Uses raw JSON-RPC to handle Bitcoin Core 28+ `warnings` field change.
 pub fn bitcoind_get_chain_tip(config: &BitcoindConfig, ctx: &Context) -> BlockIdentifier {
     let bitcoin_rpc = bitcoind_get_client(config, ctx);
     loop {
-        match bitcoin_rpc.call::<serde_json::Value>("getblockchaininfo", &[]) {
+        match bitcoin_rpc.get_blockchain_info() {
             Ok(result) => {
-                let blocks = result["blocks"].as_u64().unwrap_or(0);
-                let default_hash = "0000000000000000000000000000000000000000000000000000000000000000";
-                let hash = result["bestblockhash"].as_str().unwrap_or(default_hash);
-                let full_hash = if hash.starts_with("0x") { hash.to_string() } else { format!("0x{}", hash) };
                 return BlockIdentifier {
-                    index: blocks,
-                    hash: full_hash,
+                    index: result.blocks,
+                    hash: format!("0x{}", result.best_block_hash),
                 };
             }
             Err(e) => {
@@ -86,28 +100,20 @@ pub fn bitcoin_get_raw_transaction(
 }
 
 /// Checks if bitcoind is still synchronizing blocks and waits until it's finished if that is the case.
-/// Uses raw JSON-RPC to handle Bitcoin Core 28+ response format changes.
 pub fn bitcoind_wait_for_chain_tip(config: &BitcoindConfig, ctx: &Context) -> BlockIdentifier {
     let bitcoin_rpc = bitcoind_get_client(config, ctx);
     let mut confirmations = 0;
     let mut logged_info = false;
     loop {
-        match bitcoin_rpc.call::<serde_json::Value>("getblockchaininfo", &[]) {
+        match bitcoin_rpc.get_blockchain_info() {
             Ok(result) => {
-                let blocks = result["blocks"].as_u64().unwrap_or(0);
-                let headers = result["headers"].as_u64().unwrap_or(0);
-                let ibd = result["initialblockdownload"].as_bool().unwrap_or(true);
-                let default_hash = "0000000000000000000000000000000000000000000000000000000000000000";
-                let hash = result["bestblockhash"].as_str().unwrap_or(default_hash);
-                let full_hash = if hash.starts_with("0x") { hash.to_string() } else { format!("0x{}", hash) };
-
-                if !ibd && blocks == headers {
+                if !result.initial_block_download && result.blocks == result.headers {
                     confirmations += 1;
                     if confirmations == 10 {
-                        try_info!(ctx, "bitcoind chain tip is at block #{}", blocks);
+                        try_info!(ctx, "bitcoind chain tip is at block #{}", result.blocks);
                         return BlockIdentifier {
-                            index: blocks,
-                            hash: full_hash,
+                            index: result.blocks,
+                            hash: format!("0x{}", result.best_block_hash),
                         };
                     }
                     if !logged_info {
