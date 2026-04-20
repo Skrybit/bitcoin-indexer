@@ -113,6 +113,17 @@
           inherit bitcoin-indexer ordinals-api runes-api;
         };
 
+        # SKRYBITDEV-591: expose builds for the Skrybit Hydra CI on
+        # builder-101. Hydra's evaluator looks for `hydraJobs.<system>.<name>`
+        # (or `checks.<system>.<name>`); without this attribute Hydra reports:
+        #   "flake 'github:Skrybit/bitcoin-indexer/...' does not provide any
+        #    Hydra jobs or checks"
+        # and never builds, never pushes to harmonia, never serves the LAN
+        # cache. Expose the Rust indexer binary and both API packages.
+        hydraJobs = {
+          inherit bitcoin-indexer ordinals-api runes-api;
+        };
+
         devShells.default = pkgs.mkShell {
           packages = with pkgs; [
             rustc cargo rust-analyzer clippy rustfmt
