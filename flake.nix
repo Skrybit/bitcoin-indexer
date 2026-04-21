@@ -8,7 +8,11 @@
     # rustPlatform.buildRustPackage into a deps-only derivation (~30min cold,
     # cached across source edits) + workspace-only derivation (~3min). librocksdb-sys
     # no longer recompiles on every one-line change.
-    crane.url = "github:ipetkov/crane";
+    #
+    # Pinned to a pre-2025-10 commit — crane master requires nixpkgs-25.11, but
+    # we stay on nixos-25.05 because gcc 15 + rocksdb 10.10 in 25.11 break our
+    # librocksdb-sys 9.9.3. Bump both together when we retire rocksdb 9.9.3.
+    crane.url = "github:ipetkov/crane/95d528a5f54eaba0d12102249ce42f4d01f4e364";
   };
 
   outputs = { self, nixpkgs, flake-utils, crane }:
@@ -16,18 +20,22 @@
       let
         pkgs = nixpkgs.legacyPackages.${system};
 
-        # Use clang stdenv — rocksdb C++ compilation fails with gcc 15.
-        clangStdenv = pkgs.llvmPackages_18.stdenv;
-
-        # Crane library rebound to use clang as the C/C++ toolchain for every
-        # derivation it produces (deps-only AND final build). Passing stdenv
-        # directly to buildPackage isn't enough — the deps step needs it too
-        # or rocksdb breaks on the first cache miss.
-        craneLib = (crane.mkLib pkgs).overrideScope (_: prev: {
-          mkCargoDerivation = args: prev.mkCargoDerivation (args // {
-            stdenv = clangStdenv;
-          });
+        # Use clang for rocksdb C++ compilation — gcc 15 breaks the build.
+        # Crane exposes this via stdenvSelector (a function of pkgs → stdenv),
+        # and threads it into both the deps-only and final derivations.
+        craneLib = (crane.mkLib pkgs).overrideScope (_: _: {
+          stdenvSelector = p: p.llvmPackages_18.stdenv;
         });
+
+        # Vendor the full Cargo.lock including the hirosystems/schemars git
+        # fork (outputHashes pins the narHash of that specific rev). rustPlatform
+        # has the proven machinery for this; crane consumes the output as-is.
+        cargoVendorDir = pkgs.rustPlatform.importCargoLock {
+          lockFile = ./Cargo.lock;
+          outputHashes = {
+            "schemars-0.8.16" = "sha256-xg7TUTxo+7vDSOQQuWkTl0ajcvO9iP9IP8x8uWUcFqM=";
+          };
+        };
 
         # Shared args for both cargoArtifacts (deps-only) and the final
         # bitcoin-indexer derivation. Any change here invalidates the deps
@@ -35,6 +43,7 @@
         commonArgs = {
           src = craneLib.cleanCargoSource ./.;
           strictDeps = true;
+          inherit cargoVendorDir;
 
           nativeBuildInputs = with pkgs; [
             pkg-config
@@ -53,16 +62,6 @@
             zstd
             libunwind
           ];
-
-          # The schemars git dep comes from hirosystems/schemars on branch
-          # feat-chainhook-fixes. crane pins it via the narHash below; bump
-          # when Cargo.lock points at a new rev.
-          cargoVendorDir = craneLib.vendorCargoDeps {
-            src = ./.;
-            outputHashes = {
-              "schemars-0.8.16" = "sha256-xg7TUTxo+7vDSOQQuWkTl0ajcvO9iP9IP8x8uWUcFqM=";
-            };
-          };
 
           # Let librocksdb-sys compile its bundled rocksdb 9.9.3 from source.
           # Force clang for cc-rs via the Cargo target wrapper env vars.
