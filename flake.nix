@@ -4,33 +4,37 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.05";
     flake-utils.url = "github:numtide/flake-utils";
+    # SKRYBITDEV-592: crane for incremental Rust builds. Splits the monolithic
+    # rustPlatform.buildRustPackage into a deps-only derivation (~30min cold,
+    # cached across source edits) + workspace-only derivation (~3min). librocksdb-sys
+    # no longer recompiles on every one-line change.
+    crane.url = "github:ipetkov/crane";
   };
 
-  outputs = { self, nixpkgs, flake-utils }:
+  outputs = { self, nixpkgs, flake-utils, crane }:
     flake-utils.lib.eachDefaultSystem (system:
       let
         pkgs = nixpkgs.legacyPackages.${system};
 
-        # ── Rust indexer binary ──
-        # Use clang stdenv — rocksdb C++ compilation fails with gcc 15
+        # Use clang stdenv — rocksdb C++ compilation fails with gcc 15.
         clangStdenv = pkgs.llvmPackages_18.stdenv;
-        rustPlatformClang = pkgs.makeRustPlatform {
-          rustc = pkgs.rustc;
-          cargo = pkgs.cargo;
-          stdenv = clangStdenv;
-        };
 
-        bitcoin-indexer = rustPlatformClang.buildRustPackage {
-          pname = "bitcoin-indexer";
-          version = "3.0.0";
-          src = ./.;
+        # Crane library rebound to use clang as the C/C++ toolchain for every
+        # derivation it produces (deps-only AND final build). Passing stdenv
+        # directly to buildPackage isn't enough — the deps step needs it too
+        # or rocksdb breaks on the first cache miss.
+        craneLib = (crane.mkLib pkgs).overrideScope (_: prev: {
+          mkCargoDerivation = args: prev.mkCargoDerivation (args // {
+            stdenv = clangStdenv;
+          });
+        });
 
-          cargoLock = {
-            lockFile = ./Cargo.lock;
-            outputHashes = {
-              "schemars-0.8.16" = "sha256-xg7TUTxo+7vDSOQQuWkTl0ajcvO9iP9IP8x8uWUcFqM=";
-            };
-          };
+        # Shared args for both cargoArtifacts (deps-only) and the final
+        # bitcoin-indexer derivation. Any change here invalidates the deps
+        # cache, so keep it minimal and stable.
+        commonArgs = {
+          src = craneLib.cleanCargoSource ./.;
+          strictDeps = true;
 
           nativeBuildInputs = with pkgs; [
             pkg-config
@@ -50,34 +54,53 @@
             libunwind
           ];
 
+          # The schemars git dep comes from hirosystems/schemars on branch
+          # feat-chainhook-fixes. crane pins it via the narHash below; bump
+          # when Cargo.lock points at a new rev.
+          cargoVendorDir = craneLib.vendorCargoDeps {
+            src = ./.;
+            outputHashes = {
+              "schemars-0.8.16" = "sha256-xg7TUTxo+7vDSOQQuWkTl0ajcvO9iP9IP8x8uWUcFqM=";
+            };
+          };
+
           # Let librocksdb-sys compile its bundled rocksdb 9.9.3 from source.
           # Force clang for cc-rs via the Cargo target wrapper env vars.
-          # Nix's Rust build infra hardcodes gcc — these override it.
           CARGO_BUILD_TARGET = "x86_64-unknown-linux-gnu";
           "CC_x86_64-unknown-linux-gnu" = "${pkgs.llvmPackages_18.clang}/bin/clang";
           "CXX_x86_64-unknown-linux-gnu" = "${pkgs.llvmPackages_18.clang}/bin/clang++";
-          # rocksdb 9.9.3 missing #include <cstdint> — clang 18 is strict about this
+          # rocksdb 9.9.3 missing #include <cstdint> — clang 18 is strict.
           CXXFLAGS = "-include cstdint";
 
-          buildFeatures = [ "release" ];
-
-          # Force clang for ALL C/C++ compilation including cc-rs (rocksdb)
           LIBCLANG_PATH = "${pkgs.llvmPackages_18.libclang.lib}/lib";
           CC = "${pkgs.llvmPackages_18.clang}/bin/clang";
           CXX = "${pkgs.llvmPackages_18.clang}/bin/clang++";
-          # cc-rs uses TARGET_CC/TARGET_CXX to find the compiler
           TARGET_CC = "${pkgs.llvmPackages_18.clang}/bin/clang";
           TARGET_CXX = "${pkgs.llvmPackages_18.clang}/bin/clang++";
           HOST_CC = "${pkgs.llvmPackages_18.clang}/bin/clang";
           HOST_CXX = "${pkgs.llvmPackages_18.clang}/bin/clang++";
 
-          doCheck = false; # Tests require a running bitcoind + postgres
+          doCheck = false; # Tests require a running bitcoind + postgres.
+        };
 
+        # Deps-only derivation — compiles all transitive crates + rocksdb C++
+        # tree. Cache key is Cargo.lock + buildInputs + env. Survives every
+        # workspace source edit.
+        cargoArtifacts = craneLib.buildDepsOnly (commonArgs // {
+          pname = "bitcoin-indexer-deps";
+          version = "3.0.0";
+        });
+
+        bitcoin-indexer = craneLib.buildPackage (commonArgs // {
+          inherit cargoArtifacts;
+          pname = "bitcoin-indexer";
+          version = "3.0.0";
+          cargoExtraArgs = "--features release";
           meta = {
             description = "Bitcoin meta-protocol indexer (ordinals, BRC-20, runes)";
             mainProgram = "bitcoin-indexer";
           };
-        };
+        });
 
         # ── Ordinals API (Node.js) ──
         ordinals-api = pkgs.buildNpmPackage {
