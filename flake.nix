@@ -113,17 +113,6 @@
           inherit bitcoin-indexer ordinals-api runes-api;
         };
 
-        # SKRYBITDEV-591: expose builds for the Skrybit Hydra CI on
-        # builder-101. Hydra's evaluator looks for `hydraJobs.<system>.<name>`
-        # (or `checks.<system>.<name>`); without this attribute Hydra reports:
-        #   "flake 'github:Skrybit/bitcoin-indexer/...' does not provide any
-        #    Hydra jobs or checks"
-        # and never builds, never pushes to harmonia, never serves the LAN
-        # cache. Expose the Rust indexer binary and both API packages.
-        hydraJobs = {
-          inherit bitcoin-indexer ordinals-api runes-api;
-        };
-
         devShells.default = pkgs.mkShell {
           packages = with pkgs; [
             rustc cargo rust-analyzer clippy rustfmt
@@ -135,6 +124,17 @@
         };
       }
     ) // {
+      # SKRYBITDEV-591: flat hydraJobs (no system layer) so Hydra emits
+      # one job per package for x86_64-linux only — the only arch our
+      # fleet runs. Without this (under eachDefaultSystem) Hydra fans out
+      # to aarch64-linux + both darwin systems, all of which abort for
+      # lack of builders.
+      hydraJobs = {
+        bitcoin-indexer = self.packages.x86_64-linux.bitcoin-indexer;
+        ordinals-api    = self.packages.x86_64-linux.ordinals-api;
+        runes-api       = self.packages.x86_64-linux.runes-api;
+      };
+
       # ══════════════════════════════════════════════════════
       # NixOS Module — declarative configuration for bitcoin-indexer
       # Generates config.toml from Nix options, manages systemd services.
