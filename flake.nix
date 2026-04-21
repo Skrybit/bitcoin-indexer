@@ -27,14 +27,14 @@
           stdenvSelector = p: p.llvmPackages_18.stdenv;
         });
 
-        # Vendor the full Cargo.lock including the hirosystems/schemars git
-        # fork (outputHashes pins the narHash of that specific rev). rustPlatform
-        # has the proven machinery for this; crane consumes the output as-is.
-        cargoVendorDir = pkgs.rustPlatform.importCargoLock {
-          lockFile = ./Cargo.lock;
-          outputHashes = {
-            "schemars-0.8.16" = "sha256-xg7TUTxo+7vDSOQQuWkTl0ajcvO9iP9IP8x8uWUcFqM=";
-          };
+        # Vendor the Cargo.lock via crane's own machinery. It generates a
+        # source-replacement config that covers *both* registry and git deps —
+        # rustPlatform.importCargoLock only covers registry crates, so cargo
+        # would try to clone hirosystems/schemars at build time (no network
+        # inside the sandbox → failure). crane fetches schemars at eval time
+        # via builtins.fetchGit, so the vendor dir is complete by build time.
+        cargoVendorDir = craneLib.vendorCargoDeps {
+          src = ./.;
         };
 
         # Shared args for both cargoArtifacts (deps-only) and the final
