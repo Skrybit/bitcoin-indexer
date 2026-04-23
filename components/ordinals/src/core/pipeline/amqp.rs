@@ -55,8 +55,14 @@ pub async fn init(url: &str, exchange: &str) -> Result<(), String> {
 }
 
 /// Publish a block.indexed event. Silent no-op if AMQP not initialized.
+///
+/// `network` is the Bitcoin network name ("mainnet" | "testnet" | "signet" |
+/// "regtest") — included in the payload so consumers don't have to parse the
+/// routing key, and can cleanly branch on mainnet vs testnet events coming
+/// through the same exchange.
 pub async fn publish_block_event(
     routing_key: &str,
+    network: &str,
     block_height: u64,
     block_hash: &str,
     reveals: u64,
@@ -74,6 +80,7 @@ pub async fn publish_block_event(
 
     let payload = serde_json::json!({
         "event": "block.indexed",
+        "network": network,
         "block_height": block_height,
         "block_hash": block_hash,
         "reveals": reveals,

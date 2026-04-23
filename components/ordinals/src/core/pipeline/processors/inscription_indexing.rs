@@ -237,8 +237,19 @@ pub async fn index_block(
     // Publish block.indexed event to RabbitMQ (non-fatal on failure)
     if let Some(ref amqp) = config.amqp {
         if amqp.enabled {
+            // Normalise the network name for consumers. bitcoin crate's
+            // Network::Bitcoin serialises as "bitcoin"; downstream code
+            // is easier if we just use "mainnet".
+            let network_label = match config.bitcoind.network {
+                bitcoin::Network::Bitcoin => "mainnet",
+                bitcoin::Network::Testnet => "testnet",
+                bitcoin::Network::Signet => "signet",
+                bitcoin::Network::Regtest => "regtest",
+                _ => "unknown",
+            };
             if let Err(e) = crate::core::pipeline::amqp::publish_block_event(
                 &amqp.routing_key,
+                network_label,
                 block_height,
                 &block.block_identifier.hash,
                 reveals_count as u64,
