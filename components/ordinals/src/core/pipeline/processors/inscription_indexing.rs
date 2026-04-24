@@ -240,9 +240,14 @@ pub async fn index_block(
             // Normalise the network name for consumers. bitcoin crate's
             // Network::Bitcoin serialises as "bitcoin"; downstream code
             // is easier if we just use "mainnet".
+            // testnet3 and testnet4 both publish as "testnet" — our
+            // user-facing network label doesn't discriminate between
+            // testnet generations, and a host only runs one at a time.
+            // If that ever needs to change, split the label here.
             let network_label = match config.bitcoind.network {
                 bitcoin::Network::Bitcoin => "mainnet",
                 bitcoin::Network::Testnet => "testnet",
+                bitcoin::Network::Testnet4 => "testnet",
                 bitcoin::Network::Signet => "signet",
                 bitcoin::Network::Regtest => "regtest",
                 _ => "unknown",

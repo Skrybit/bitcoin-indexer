@@ -132,7 +132,9 @@ impl ConfigToml {
     fn config_from_toml(toml: ConfigToml) -> Result<Config, String> {
         let bitcoin_network = match toml.bitcoind.network.as_str() {
             "devnet" => Network::Regtest,
+            "regtest" => Network::Regtest,
             "testnet" => Network::Testnet,
+            "testnet4" => Network::Testnet4,
             "mainnet" => Network::Bitcoin,
             "signet" => Network::Signet,
             _ => return Err("bitcoind.network not supported".to_string()),
