@@ -267,7 +267,7 @@
             };
 
             network = mkOption {
-              type = types.enum [ "mainnet" "testnet" "signet" "regtest" ];
+              type = types.enum [ "mainnet" "testnet" "testnet4" "signet" "regtest" ];
               default = "mainnet";
             };
 
