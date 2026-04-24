@@ -37,11 +37,27 @@
           src = ./.;
         };
 
+        # Source filter — crane's default cleanCargoSource strips every
+        # non-Rust file. But refinery's `embed_migrations!` proc macro
+        # reads .sql files from migrations/ at compile time; if those
+        # aren't present in the build sandbox, the macro silently bakes
+        # zero migrations into the binary and every boot ends in
+        # `relation "inscriptions" does not exist`. Extend the filter to
+        # keep migrations/ (SKRYBITDEV-PD.1, ADR-015 open follow-up).
+        indexerSrc = pkgs.lib.cleanSourceWith {
+          src = ./.;
+          filter = path: type:
+            (craneLib.filterCargoSources path type)
+            || (pkgs.lib.hasInfix "/migrations/" (toString path))
+            || (pkgs.lib.hasSuffix "/migrations" (toString path));
+          name = "source";
+        };
+
         # Shared args for both cargoArtifacts (deps-only) and the final
         # bitcoin-indexer derivation. Any change here invalidates the deps
         # cache, so keep it minimal and stable.
         commonArgs = {
-          src = craneLib.cleanCargoSource ./.;
+          src = indexerSrc;
           strictDeps = true;
           inherit cargoVendorDir;
 
