@@ -262,7 +262,14 @@ async fn new_ordinals_indexer_runloop(
 pub async fn get_chain_tip(config: &Config) -> Result<BlockIdentifier, String> {
     let pool = pg_pool(&config.ordinals.as_ref().unwrap().db)?;
     let ord_client = pg_pool_client(&pool).await?;
-    Ok(db::ordinals_pg::get_chain_tip(&ord_client).await?.unwrap())
+    // Empty DB on first boot returns None — fall back to a zero-tip so
+    // start_ordinals_indexer can initialise from scratch instead of panicking.
+    Ok(db::ordinals_pg::get_chain_tip(&ord_client)
+        .await?
+        .unwrap_or_else(|| BlockIdentifier {
+            index: 0,
+            hash: "0x0000000000000000000000000000000000000000000000000000000000000000".into(),
+        }))
 }
 
 /// SKRYBITDEV-586: Public wrapper around
