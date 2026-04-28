@@ -154,15 +154,10 @@ async fn new_runes_indexer_runloop(
         .expect("unable to spawn thread");
 
     let pg_client = pg_pool_client(pg_pool).await?;
-    let chain_tip = db::get_chain_tip(&pg_client)
-        .await
-        .unwrap_or(BlockIdentifier {
-            index: get_rune_genesis_block_height(config.bitcoind.network) - 1,
-            hash: "0x0000000000000000000000000000000000000000000000000000000000000000".into(),
-        });
+    let chain_tip = db::get_chain_tip(&pg_client).await;
     Ok(Indexer {
         commands_tx,
-        chain_tip: Some(chain_tip),
+        chain_tip,
         thread_handle: Some(handle),
     })
 }
@@ -235,10 +230,11 @@ pub async fn start_runes_indexer(
     {
         let pg_client = pg_pool_client(&pool).await?;
         let max_rune_number = db::pg_get_max_rune_number(&pg_client).await;
+        let genesis = get_rune_genesis_block_height(config.bitcoind.network);
         let chain_tip = db::get_chain_tip(&pg_client)
             .await
             .unwrap_or(BlockIdentifier {
-                index: get_rune_genesis_block_height(config.bitcoind.network) - 1,
+                index: genesis.saturating_sub(1),
                 hash: "0x0000000000000000000000000000000000000000000000000000000000000000".into(),
             });
         prometheus
