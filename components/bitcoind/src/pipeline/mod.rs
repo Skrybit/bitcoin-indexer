@@ -363,7 +363,12 @@ pub(crate) async fn download_rpc_blocks(
         let block_pool_ref = block_pool.clone();
         let pool = block_pool_ref.lock().unwrap();
         let chain_tip = pool.canonical_chain_tip().or(indexer.chain_tip.as_ref());
-        let start_block = chain_tip.map_or(0, |ct| ct.index + 1);
+        // When the index is empty, start from the protocol activation height
+        // (sequence_start_block_height) rather than block 0. Otherwise sub-
+        // protocols like Runes (genesis 840000) waste hours scanning blocks
+        // that can't possibly contain protocol data.
+        let start_block =
+            chain_tip.map_or(sequence_start_block_height, |ct| ct.index + 1);
         BlockHeights::BlockRange(start_block, target_block_height)
             .get_sorted_entries()
             .map_err(|_e| "Block start / end block spec invalid".to_string())?
