@@ -13,6 +13,8 @@ use super::models::{DbOperation, DbToken};
 embed_migrations!("../../migrations/ordinals-brc20");
 pub async fn migrate(pg_client: &mut Client) -> Result<(), String> {
     return match migrations::runner()
+        .set_abort_divergent(false)
+        .set_abort_missing(false)
         .set_migration_table_name("pgmigrations")
         .run_async(pg_client)
         .await
