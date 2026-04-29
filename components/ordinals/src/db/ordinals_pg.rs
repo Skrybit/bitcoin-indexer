@@ -393,8 +393,15 @@ pub async fn get_inscribed_satpoints_at_tx_inputs<T: GenericClient>(
 /// Bulk variant of [`get_inscribed_satpoints_at_tx_inputs`] keyed by outpoint
 /// rather than by per-tx vin. Used by the block-start prefetch path to load
 /// inscribed-satpoint state for every input referenced anywhere in the block
-/// in a single round-trip, eliminating the per-transaction query that
+/// in chunked round-trips, eliminating the per-transaction query that
 /// dominates `augment_block_with_transfers` on busy blocks. See ADR-016.
+///
+/// Uses the same `VALUES`-CTE join pattern as the legacy per-tx fn, chunked at
+/// 500 outpoints per query, because postgres picks a nested-loop-with-index-
+/// seek plan for small VALUES sets but falls back to a hash join over the
+/// whole `current_locations` table when given a multi-thousand-element
+/// `WHERE output = ANY($1)` array. The hash-join plan was the cause of the
+/// 2026-04-29 mainnet regression on block 825213.
 pub async fn get_inscribed_satpoints_at_outpoints<T: GenericClient>(
     outpoints: &[String],
     client: &T,
@@ -403,24 +410,34 @@ pub async fn get_inscribed_satpoints_at_outpoints<T: GenericClient>(
     if outpoints.is_empty() {
         return Ok(results);
     }
-    let rows = client
-        .query(
-            "SELECT output, ordinal_number, \"offset\" \
-             FROM current_locations \
-             WHERE output = ANY($1)",
-            &[&outpoints],
-        )
-        .await
-        .map_err(|e| format!("get_inscribed_satpoints_at_outpoints: {e}"))?;
-    for row in rows.iter() {
-        let output: String = row.get("output");
-        let ordinal_number: PgNumericU64 = row.get("ordinal_number");
-        let offset: PgNumericU64 = row.get("offset");
-        let entry = results.entry(output).or_default();
-        entry.push(WatchedSatpoint {
-            ordinal_number: ordinal_number.0,
-            offset: offset.0,
-        });
+    for chunk in outpoints.chunks(500) {
+        let mut params: Vec<&(dyn ToSql + Sync)> = Vec::with_capacity(chunk.len());
+        for outpoint in chunk.iter() {
+            params.push(outpoint);
+        }
+        let rows = client
+            .query(
+                &format!(
+                    "WITH outpoints (output) AS (VALUES {}) \
+                     SELECT l.output, l.ordinal_number, l.\"offset\" \
+                     FROM current_locations AS l \
+                     INNER JOIN outpoints AS i ON i.output = l.output",
+                    utils::multi_row_query_param_str(chunk.len(), 1)
+                ),
+                &params,
+            )
+            .await
+            .map_err(|e| format!("get_inscribed_satpoints_at_outpoints: {e}"))?;
+        for row in rows.iter() {
+            let output: String = row.get("output");
+            let ordinal_number: PgNumericU64 = row.get("ordinal_number");
+            let offset: PgNumericU64 = row.get("offset");
+            let entry = results.entry(output).or_default();
+            entry.push(WatchedSatpoint {
+                ordinal_number: ordinal_number.0,
+                offset: offset.0,
+            });
+        }
     }
     Ok(results)
 }
