@@ -390,6 +390,41 @@ pub async fn get_inscribed_satpoints_at_tx_inputs<T: GenericClient>(
     Ok(results)
 }
 
+/// Bulk variant of [`get_inscribed_satpoints_at_tx_inputs`] keyed by outpoint
+/// rather than by per-tx vin. Used by the block-start prefetch path to load
+/// inscribed-satpoint state for every input referenced anywhere in the block
+/// in a single round-trip, eliminating the per-transaction query that
+/// dominates `augment_block_with_transfers` on busy blocks. See ADR-016.
+pub async fn get_inscribed_satpoints_at_outpoints<T: GenericClient>(
+    outpoints: &[String],
+    client: &T,
+) -> Result<HashMap<String, Vec<WatchedSatpoint>>, String> {
+    let mut results: HashMap<String, Vec<WatchedSatpoint>> = HashMap::new();
+    if outpoints.is_empty() {
+        return Ok(results);
+    }
+    let rows = client
+        .query(
+            "SELECT output, ordinal_number, \"offset\" \
+             FROM current_locations \
+             WHERE output = ANY($1)",
+            &[&outpoints],
+        )
+        .await
+        .map_err(|e| format!("get_inscribed_satpoints_at_outpoints: {e}"))?;
+    for row in rows.iter() {
+        let output: String = row.get("output");
+        let ordinal_number: PgNumericU64 = row.get("ordinal_number");
+        let offset: PgNumericU64 = row.get("offset");
+        let entry = results.entry(output).or_default();
+        entry.push(WatchedSatpoint {
+            ordinal_number: ordinal_number.0,
+            offset: offset.0,
+        });
+    }
+    Ok(results)
+}
+
 async fn insert_inscriptions<T: GenericClient>(
     inscriptions: &[DbInscription],
     client: &T,

@@ -47,6 +47,41 @@ pub fn parse_output_and_offset_from_satpoint(
     Ok((format!("{}:{}", tx_id, output), offset))
 }
 
+/// Feature flag for the block-start UTXO prefetch path introduced in ADR-016.
+/// When enabled, [`augment_block_with_transfers`] issues a single bulk query
+/// at block start to load every inscribed-satpoint location referenced as an
+/// input anywhere in the block, replacing ~one postgres round-trip per
+/// transaction with one round-trip per block. Default off until validated
+/// side-by-side against the legacy path.
+fn fast_sat_tracking_enabled() -> bool {
+    std::env::var("BITCOIN_INDEXER_FAST_SAT_TRACKING")
+        .map(|v| matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
+/// Collect every distinct outpoint that appears as a tx input anywhere in
+/// `block` and load their inscribed-satpoint state from postgres in one
+/// query.
+async fn prefetch_block_input_satpoints(
+    block: &BitcoinBlockData,
+    db_tx: &Transaction<'_>,
+) -> Result<HashMap<String, Vec<WatchedSatpoint>>, String> {
+    let mut seen: HashSet<String> = HashSet::new();
+    for tx in block.transactions.iter() {
+        for input in tx.metadata.inputs.iter() {
+            seen.insert(format_outpoint_to_watch(
+                &input.previous_output.txid,
+                input.previous_output.vout as usize,
+            ));
+        }
+    }
+    if seen.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let outpoints: Vec<String> = seen.into_iter().collect();
+    ordinals_pg::get_inscribed_satpoints_at_outpoints(&outpoints, db_tx).await
+}
+
 pub async fn augment_block_with_transfers(
     block: &mut BitcoinBlockData,
     db_tx: &Transaction<'_>,
@@ -54,13 +89,51 @@ pub async fn augment_block_with_transfers(
     reveals_count: &mut usize,
     transfers_count: &mut usize,
 ) -> Result<(), String> {
+    augment_block_with_transfers_inner(
+        block,
+        db_tx,
+        ctx,
+        reveals_count,
+        transfers_count,
+        fast_sat_tracking_enabled(),
+    )
+    .await
+}
+
+/// Inner implementation parameterised on the fast-path flag so tests can
+/// exercise both paths without racing on a process-wide env var.
+async fn augment_block_with_transfers_inner(
+    block: &mut BitcoinBlockData,
+    db_tx: &Transaction<'_>,
+    ctx: &Context,
+    reveals_count: &mut usize,
+    transfers_count: &mut usize,
+    fast_path: bool,
+) -> Result<(), String> {
     let network = get_bitcoin_network(&block.metadata.network);
     let mut block_transferred_satpoints = HashMap::new();
+
+    let prefetched: Option<HashMap<String, Vec<WatchedSatpoint>>> = if fast_path {
+        let prefetch_start = std::time::Instant::now();
+        let map = prefetch_block_input_satpoints(block, db_tx).await?;
+        try_debug!(
+            ctx,
+            "fast sat-tracking: prefetched {hits} inscribed outpoints across block #{height} in {elapsed}ms",
+            hits = map.len(),
+            height = block.block_identifier.index,
+            elapsed = prefetch_start.elapsed().as_millis()
+        );
+        Some(map)
+    } else {
+        None
+    };
+
     for (tx_index, tx) in block.transactions.iter_mut().enumerate() {
         augment_transaction_with_ordinal_transfers(
             tx,
             tx_index,
             &mut block_transferred_satpoints,
+            prefetched.as_ref(),
             &block.block_identifier,
             &network,
             db_tx,
@@ -160,6 +233,7 @@ pub async fn augment_transaction_with_ordinal_transfers(
     tx: &mut BitcoinTransactionData,
     tx_index: usize,
     block_transferred_satpoints: &mut HashMap<String, Vec<WatchedSatpoint>>,
+    prefetched_block_satpoints: Option<&HashMap<String, Vec<WatchedSatpoint>>>,
     block_identifier: &BlockIdentifier,
     network: &Network,
     db_tx: &Transaction<'_>,
@@ -183,23 +257,38 @@ pub async fn augment_transaction_with_ordinal_transfers(
     // Since the DB state is currently at the end of the previous block, and there may be multiple transfers for the same sat in
     // this new block, we'll use a memory cache to keep all sats that have been transferred but have not yet been written into the
     // DB.
-    let mut cached_satpoints = HashMap::new();
+    let mut input_satpoints: HashMap<usize, Vec<WatchedSatpoint>> = HashMap::new();
     let mut inputs_for_db_lookup = vec![];
     for (vin, input) in tx.metadata.inputs.iter().enumerate() {
         let output_key = format_outpoint_to_watch(
             &input.previous_output.txid,
             input.previous_output.vout as usize,
         );
-        // Look in memory cache, or save for a batched DB lookup later.
+        // Intra-block chained-transfer cache: if a prior tx in this block
+        // already moved an inscribed sat onto this output, consume it here
+        // (removing prevents double-application on a later input).
         if let Some(watched_satpoints) = block_transferred_satpoints.remove(&output_key) {
-            cached_satpoints.insert(vin, watched_satpoints);
-        } else {
-            inputs_for_db_lookup.push((vin, output_key));
+            input_satpoints.insert(vin, watched_satpoints);
+            continue;
         }
+        // Fast path (ADR-016): when the block-start prefetch ran, every
+        // inscribed-satpoint location referenced anywhere in this block is
+        // already in `prefetched_block_satpoints`. A miss means there is no
+        // inscription on this input, so no DB lookup is needed.
+        if let Some(prefetch) = prefetched_block_satpoints {
+            if let Some(watched) = prefetch.get(&output_key) {
+                input_satpoints.insert(vin, watched.clone());
+            }
+            continue;
+        }
+        // Legacy path: defer this input to a per-tx batched DB lookup.
+        inputs_for_db_lookup.push((vin, output_key));
     }
-    let mut input_satpoints =
-        ordinals_pg::get_inscribed_satpoints_at_tx_inputs(&inputs_for_db_lookup, db_tx).await?;
-    input_satpoints.extend(cached_satpoints);
+    if !inputs_for_db_lookup.is_empty() {
+        let from_db =
+            ordinals_pg::get_inscribed_satpoints_at_tx_inputs(&inputs_for_db_lookup, db_tx).await?;
+        input_satpoints.extend(from_db);
+    }
 
     // Process all transfers across all inputs.
     for (input_index, input) in tx.metadata.inputs.iter().enumerate() {
@@ -270,7 +359,7 @@ mod test {
     };
     use postgres::{pg_begin, pg_pool_client};
 
-    use super::compute_satpoint_post_transfer;
+    use super::{augment_block_with_transfers_inner, compute_satpoint_post_transfer};
     use crate::{
         core::{
             protocol::satoshi_tracking::augment_block_with_transfers,
@@ -391,6 +480,158 @@ mod test {
             augment_block_with_transfers(&mut block, &client, &ctx, &mut 0, &mut 0).await?;
 
             // 3. Make sure the correct transfers were produced
+            assert_eq!(
+                &block.transactions[1].metadata.ordinal_operations[0],
+                &OrdinalOperation::InscriptionTransferred(OrdinalInscriptionTransferData {
+                    ordinal_number,
+                    destination: OrdinalInscriptionTransferDestination::Transferred(
+                        "bc1pp9z0rmh34re5aaxskkpgdfg3zkrc40wmas4r60vvtqdhrlcufw7qmgufuz".into()
+                    ),
+                    satpoint_pre_transfer:
+                        "cbc9fcf9373cbae36f4868d73a0ad78bbdc58af7c813e6319163e101a8cac8ad:0:0"
+                            .into(),
+                    satpoint_post_transfer:
+                        "30a5a4861a28436a229a6a08872057bd3970382955e6be8fb7f0fde31c3424bd:0:0"
+                            .into(),
+                    post_transfer_output_value: Some(546),
+                    tx_index: 1,
+                })
+            );
+            assert_eq!(
+                &block.transactions[2].metadata.ordinal_operations[0],
+                &OrdinalOperation::InscriptionTransferred(OrdinalInscriptionTransferData {
+                    ordinal_number,
+                    destination: OrdinalInscriptionTransferDestination::Transferred(
+                        "bc1p3qus9j7ucg0c4s2pf7k70nlpkk7r3ddt4u2ek54wn6nuwkzm9twqfenmjm".into()
+                    ),
+                    satpoint_pre_transfer:
+                        "30a5a4861a28436a229a6a08872057bd3970382955e6be8fb7f0fde31c3424bd:0:0"
+                            .into(),
+                    satpoint_post_transfer:
+                        "0029b328fee7ab916ba98c194f21a084a4a781170610644de518dd0733c0d5d2:0:0"
+                            .into(),
+                    post_transfer_output_value: Some(546),
+                    tx_index: 2,
+                })
+            );
+
+            Ok(())
+        };
+        pg_reset_db(&mut pg_client).await?;
+        result
+    }
+
+    #[tokio::test]
+    async fn fast_path_matches_legacy_for_chained_transfers() -> Result<(), String> {
+        // Mirrors `tracks_chained_satoshi_transfers_in_block` but routes through
+        // the ADR-016 fast path (block-start prefetch) instead of the per-tx
+        // legacy DB lookup. Asserts the same transfer events are produced.
+        let ordinal_number: u64 = 283888212016616;
+        let inscription_id =
+            "cbc9fcf9373cbae36f4868d73a0ad78bbdc58af7c813e6319163e101a8cac8adi1245".to_string();
+        let block_height_1: u64 = 874387;
+        let block_height_2: u64 = 875364;
+
+        let ctx = Context::empty();
+        let mut pg_client = pg_test_connection().await;
+        ordinals_pg::migrate(&mut pg_client).await?;
+        let result = {
+            let mut ord_client = pg_pool_client(&pg_test_connection_pool()).await?;
+            let client = pg_begin(&mut ord_client).await?;
+
+            let block = TestBlockBuilder::new()
+                .height(block_height_1)
+                .hash("0x000000000000000000021668d82e096a1aad3934b5a6f8f707ad29ade2505580".into())
+                .add_transaction(
+                    TestTransactionBuilder::new()
+                        .hash(
+                            "0xcbc9fcf9373cbae36f4868d73a0ad78bbdc58af7c813e6319163e101a8cac8ad"
+                                .into(),
+                        )
+                        .add_ordinal_operation(
+                            OrdinalOperation::InscriptionRevealed(
+                                OrdinalInscriptionRevealData {
+                                    content_bytes: "0x".into(),
+                                    content_type: "".into(),
+                                    content_length: 0,
+                                    inscription_number: OrdinalInscriptionNumber { classic: 79754112, jubilee: 79754112 },
+                                    inscription_fee: 1161069,
+                                    inscription_output_value: 546,
+                                    inscription_id,
+                                    inscription_input_index: 0,
+                                    inscription_pointer: Some(0),
+                                    inscriber_address: Some("bc1p3qus9j7ucg0c4s2pf7k70nlpkk7r3ddt4u2ek54wn6nuwkzm9twqfenmjm".into()),
+                                    delegate: None,
+                                    metaprotocol: None,
+                                    metadata: None,
+                                    parents: vec![],
+                                    ordinal_number,
+                                    ordinal_block_height: 56777,
+                                    ordinal_offset: 0,
+                                    tx_index: 0,
+                                    transfers_pre_inscription: 0,
+                                    satpoint_post_inscription: "cbc9fcf9373cbae36f4868d73a0ad78bbdc58af7c813e6319163e101a8cac8ad:0:0".into(),
+                                    curse_type: None,
+                                    charms: 0,
+                                    unbound_sequence: None,
+                                },
+                            ),
+                        )
+                        .build(),
+                )
+                .build();
+            ordinals_pg::insert_block(&block, &client).await?;
+
+            let mut block = TestBlockBuilder::new()
+                .height(block_height_2)
+                .hash("0x00000000000000000001efc5fba69f0ebd5645a18258ec3cf109ca3636327242".into())
+                .add_transaction(TestTransactionBuilder::new().build())
+                .add_transaction(
+                    TestTransactionBuilder::new()
+                        .hash(
+                            "0x30a5a4861a28436a229a6a08872057bd3970382955e6be8fb7f0fde31c3424bd"
+                                .into(),
+                        )
+                        .add_input(
+                            TestTxInBuilder::new()
+                                .prev_out_block_height(block_height_1)
+                                .prev_out_tx_hash("0xcbc9fcf9373cbae36f4868d73a0ad78bbdc58af7c813e6319163e101a8cac8ad".into())
+                                .value(546)
+                                .build()
+                        )
+                        .add_output(
+                            TestTxOutBuilder::new()
+                                .value(546)
+                                .script_pubkey("0x51200944f1eef1a8f34ef4d0b58286a51115878abddbec2a3d3d8c581b71ff1c4bbc".into())
+                                .build()
+                        )
+                        .build(),
+                )
+                .add_transaction(
+                    TestTransactionBuilder::new()
+                        .hash(
+                            "0x0029b328fee7ab916ba98c194f21a084a4a781170610644de518dd0733c0d5d2"
+                                .into(),
+                        )
+                        .add_input(
+                            TestTxInBuilder::new()
+                                .prev_out_block_height(block_height_2)
+                                .prev_out_tx_hash("0x30a5a4861a28436a229a6a08872057bd3970382955e6be8fb7f0fde31c3424bd".into())
+                                .value(546)
+                                .build()
+                        )
+                        .add_output(
+                            TestTxOutBuilder::new()
+                                .value(546)
+                                .script_pubkey("0x5120883902cbdcc21f8ac1414fade7cfe1b5bc38b5abaf159b52ae9ea7c7585b2adc".into())
+                                .build()
+                        )
+                        .build()
+                )
+                .build();
+            augment_block_with_transfers_inner(&mut block, &client, &ctx, &mut 0, &mut 0, true)
+                .await?;
+
             assert_eq!(
                 &block.transactions[1].metadata.ordinal_operations[0],
                 &OrdinalOperation::InscriptionTransferred(OrdinalInscriptionTransferData {

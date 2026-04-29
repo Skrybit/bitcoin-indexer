@@ -301,6 +301,18 @@
               enable = mkOption { type = types.bool; default = true; };
               db = mkOption { type = pgDbType; };
 
+              fastSatTracking = mkOption {
+                type = types.bool;
+                default = false;
+                description = ''
+                  Enable the block-start UTXO prefetch path for ordinal
+                  transfer detection (ADR-016). Replaces the per-transaction
+                  postgres roundtrip in `augment_block_with_transfers` with a
+                  single bulk query at block start. Default off until
+                  validated side-by-side against the legacy path.
+                '';
+              };
+
               brc20 = {
                 enable = mkOption { type = types.bool; default = true; };
                 lruCacheSize = mkOption { type = types.int; default = 50000; };
@@ -364,6 +376,9 @@
               after = [ "network-online.target" ];
               wants = [ "network-online.target" ];
               wantedBy = [ "multi-user.target" ];
+              environment = optionalAttrs cfg.ordinals.fastSatTracking {
+                BITCOIN_INDEXER_FAST_SAT_TRACKING = "1";
+              };
               serviceConfig = {
                 Type = "simple";
                 User = "bitcoin-indexer";
