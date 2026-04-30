@@ -66,13 +66,21 @@ ord_get "/r/blockheight"            "$OUT_DIR/blockheight.txt"
 ord_get "/r/blockhash"              "$OUT_DIR/blockhash-tip.txt"
 ord_get "/r/blockhash/$HEIGHT"      "$OUT_DIR/blockhash-$HEIGHT.txt"
 
-# 2. Inscriptions in this block (paginated; capture page 0 and 1)
-ord_get "/r/inscriptions/block/$HEIGHT/0" "$OUT_DIR/inscriptions-block-page0.json"
+# 2. Inscriptions in this block (paginated; capture page 0 and 1).
+# ord 0.27 exposes this on the human path with Accept: json — the
+# /r/recursive prefix doesn't carry it. Returns {ids[], more, page_index}.
+ord_get "/inscriptions/block/$HEIGHT/0" "$OUT_DIR/inscriptions-block-page0.json"
 prettify "$OUT_DIR/inscriptions-block-page0.json"
-ord_get "/r/inscriptions/block/$HEIGHT/1" "$OUT_DIR/inscriptions-block-page1.json" || true
+ord_get "/inscriptions/block/$HEIGHT/1" "$OUT_DIR/inscriptions-block-page1.json" || true
 prettify "$OUT_DIR/inscriptions-block-page1.json"
 
-# 3. Per-inscription metadata for the first few inscriptions of the block
+# 2b. Block metadata (fees, tx count, hashes, timestamps).
+ord_get "/r/blockinfo/$HEIGHT" "$OUT_DIR/blockinfo.json"
+prettify "$OUT_DIR/blockinfo.json"
+
+# 3. Per-inscription metadata for the first few inscriptions of the block.
+# Response shape: {id, number, sat, output, satpoint, address, content_type,
+# content_length, fee, height, value, timestamp, charms, delegate}.
 if command -v jq >/dev/null 2>&1; then
     ids="$(jq -r '.ids[]?' "$OUT_DIR/inscriptions-block-page0.json" 2>/dev/null | head -5 || true)"
     if [[ -n "$ids" ]]; then
