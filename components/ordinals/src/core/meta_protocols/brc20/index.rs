@@ -286,6 +286,16 @@ pub async fn index_block_and_insert_brc20_operations(
     monitoring.metrics_record_brc20_transfer_total(transfer_count);
     monitoring.metrics_record_brc20_transfer_send_total(transfer_send_count);
 
+    // SKRYBITDEV-301: per-protocol per-block metrics. Reveals = deploys + mints
+    // (creation-style events); transfers = transfers + transfer_sends.
+    monitoring.metrics_record_block_completion(
+        "brc20",
+        block_height,
+        elapsed.as_secs_f64(),
+        deploy_count + mint_count,
+        transfer_count + transfer_send_count,
+    );
+
     try_info!(
         ctx,
         "Completed BRC-20 indexing for block #{block_height}: found {deploy_count} deploys, {mint_count} mints, {transfer_count} transfers, and {transfer_send_count} transfer_sends in {elapsed:.0}s",

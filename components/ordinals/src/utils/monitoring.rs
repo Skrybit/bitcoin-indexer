@@ -15,7 +15,7 @@ use hyper::{
 use postgres::{pg_begin, pg_pool_client};
 use prometheus::{
     core::{AtomicU64, GenericGauge},
-    Encoder, Histogram, HistogramOpts, Registry, TextEncoder,
+    Encoder, Histogram, HistogramOpts, HistogramVec, IntGaugeVec, Opts, Registry, TextEncoder,
 };
 use tokio::time::sleep;
 
@@ -62,6 +62,18 @@ pub struct PrometheusMonitoring {
     pub block_standardize_errors_total: UInt64Gauge,
     pub block_download_errors_total: UInt64Gauge,
     pub failed_blocks_pending: UInt64Gauge,
+
+    // SKRYBITDEV-301: Per-protocol per-block metrics. The existing histograms
+    // and gauges above are unlabeled and stay in place to keep existing alerts
+    // and dashboards working. These new metrics carry a `protocol` label
+    // (`inscription` | `brc20`) so the indexer can publish a unified
+    // block-completion view with one metric family per concept. The `network`
+    // dimension stays on the Prometheus `job` label (`bitcoin-indexer-mainnet`
+    // / `-testnet` / `-signet`).
+    pub block_indexing_duration_seconds: HistogramVec,
+    pub inscription_reveals_per_block: HistogramVec,
+    pub inscription_transfers_per_block: HistogramVec,
+    pub last_indexed_block_height_by_protocol: IntGaugeVec,
 
     // Registry
     pub registry: Registry,
@@ -219,6 +231,64 @@ impl PrometheusMonitoring {
             "Number of rows in the `failed_blocks` table with resolved_at IS NULL.",
         );
 
+        // SKRYBITDEV-301: per-protocol labeled block metrics.
+        let block_indexing_duration_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "block_indexing_duration_seconds",
+                "Wall-clock time to index a single block, in seconds, labeled by protocol.",
+            )
+            .buckets(vec![
+                0.5, 1.0, 2.5, 5.0, 10.0, 20.0, 30.0, 60.0, 120.0, 300.0, 600.0,
+            ]),
+            &["protocol"],
+        )
+        .unwrap();
+        registry
+            .register(Box::new(block_indexing_duration_seconds.clone()))
+            .unwrap();
+
+        let inscription_reveals_per_block = HistogramVec::new(
+            HistogramOpts::new(
+                "inscription_reveals_per_block",
+                "Number of inscription reveals (or BRC-20 deploys+mints) found per block, by protocol.",
+            )
+            .buckets(vec![
+                1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 5000.0,
+            ]),
+            &["protocol"],
+        )
+        .unwrap();
+        registry
+            .register(Box::new(inscription_reveals_per_block.clone()))
+            .unwrap();
+
+        let inscription_transfers_per_block = HistogramVec::new(
+            HistogramOpts::new(
+                "inscription_transfers_per_block",
+                "Number of inscription transfers (or BRC-20 transfer/transfer_send) per block, by protocol.",
+            )
+            .buckets(vec![
+                1.0, 10.0, 50.0, 100.0, 500.0, 1000.0, 5000.0, 10000.0, 50000.0, 100000.0,
+            ]),
+            &["protocol"],
+        )
+        .unwrap();
+        registry
+            .register(Box::new(inscription_transfers_per_block.clone()))
+            .unwrap();
+
+        let last_indexed_block_height_by_protocol = IntGaugeVec::new(
+            Opts::new(
+                "last_indexed_block_height_by_protocol",
+                "Height of the most recently indexed block, labeled by protocol.",
+            ),
+            &["protocol"],
+        )
+        .unwrap();
+        registry
+            .register(Box::new(last_indexed_block_height_by_protocol.clone()))
+            .unwrap();
+
         PrometheusMonitoring {
             last_indexed_block_height,
             last_indexed_inscription_number,
@@ -243,6 +313,10 @@ impl PrometheusMonitoring {
             block_standardize_errors_total,
             block_download_errors_total,
             failed_blocks_pending,
+            block_indexing_duration_seconds,
+            inscription_reveals_per_block,
+            inscription_transfers_per_block,
+            last_indexed_block_height_by_protocol,
             registry,
         }
     }
@@ -431,6 +505,34 @@ impl PrometheusMonitoring {
     pub fn metrics_record_brc20_transfer_send_total(&self, transfer_send_count: u64) {
         self.brc20_transfer_send_operations_total
             .add(transfer_send_count);
+    }
+
+    // SKRYBITDEV-301: per-protocol completion observers. Called once per
+    // block per protocol from the same code path that emits the
+    // "Completed ... indexing for block #N" log line.
+    pub fn metrics_record_block_completion(
+        &self,
+        protocol: &str,
+        block_height: u64,
+        elapsed_seconds: f64,
+        reveals: u64,
+        transfers: u64,
+    ) {
+        self.block_indexing_duration_seconds
+            .with_label_values(&[protocol])
+            .observe(elapsed_seconds);
+        self.inscription_reveals_per_block
+            .with_label_values(&[protocol])
+            .observe(reveals as f64);
+        self.inscription_transfers_per_block
+            .with_label_values(&[protocol])
+            .observe(transfers as f64);
+        let gauge = self
+            .last_indexed_block_height_by_protocol
+            .with_label_values(&[protocol]);
+        if (block_height as i64) > gauge.get() {
+            gauge.set(block_height as i64);
+        }
     }
 }
 

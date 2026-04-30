@@ -11,7 +11,7 @@ use hyper::{
 };
 use prometheus::{
     core::{AtomicF64, AtomicU64, GenericCounter, GenericGauge},
-    Encoder, Histogram, HistogramOpts, Registry, TextEncoder,
+    Encoder, Histogram, HistogramOpts, HistogramVec, IntGaugeVec, Opts, Registry, TextEncoder,
 };
 use tokio::time::{sleep, Duration};
 
@@ -48,6 +48,15 @@ pub struct PrometheusMonitoring {
     pub block_standardize_errors_total: UInt64Gauge,
     pub block_download_errors_total: UInt64Gauge,
     pub failed_blocks_pending: UInt64Gauge,
+
+    // SKRYBITDEV-301: Per-protocol per-block metrics, mirroring the ordinals
+    // indexer. The runes indexer always emits with `protocol="runes"`, but
+    // sharing the metric names lets a single Grafana panel pivot across all
+    // three protocols (inscription / brc20 / runes).
+    pub block_indexing_duration_seconds: HistogramVec,
+    pub inscription_reveals_per_block: HistogramVec,
+    pub inscription_transfers_per_block: HistogramVec,
+    pub last_indexed_block_height_by_protocol: IntGaugeVec,
 
     // Registry
     pub registry: Registry,
@@ -178,6 +187,64 @@ impl PrometheusMonitoring {
             "Number of rows in the runes `failed_blocks` table with resolved_at IS NULL.",
         );
 
+        // SKRYBITDEV-301: per-protocol labeled block metrics.
+        let block_indexing_duration_seconds = HistogramVec::new(
+            HistogramOpts::new(
+                "block_indexing_duration_seconds",
+                "Wall-clock time to index a single block, in seconds, labeled by protocol.",
+            )
+            .buckets(vec![
+                0.5, 1.0, 2.5, 5.0, 10.0, 20.0, 30.0, 60.0, 120.0, 300.0, 600.0,
+            ]),
+            &["protocol"],
+        )
+        .unwrap();
+        registry
+            .register(Box::new(block_indexing_duration_seconds.clone()))
+            .unwrap();
+
+        let inscription_reveals_per_block = HistogramVec::new(
+            HistogramOpts::new(
+                "inscription_reveals_per_block",
+                "Creation-style operations per block (inscription reveals / BRC-20 deploys+mints / Runes etchings+mints), by protocol.",
+            )
+            .buckets(vec![
+                1.0, 5.0, 10.0, 25.0, 50.0, 100.0, 250.0, 500.0, 1000.0, 5000.0,
+            ]),
+            &["protocol"],
+        )
+        .unwrap();
+        registry
+            .register(Box::new(inscription_reveals_per_block.clone()))
+            .unwrap();
+
+        let inscription_transfers_per_block = HistogramVec::new(
+            HistogramOpts::new(
+                "inscription_transfers_per_block",
+                "Transfer-style operations per block (inscription transfers / BRC-20 transfers+sends / Runes edicts), by protocol.",
+            )
+            .buckets(vec![
+                1.0, 10.0, 50.0, 100.0, 500.0, 1000.0, 5000.0, 10000.0, 50000.0, 100000.0,
+            ]),
+            &["protocol"],
+        )
+        .unwrap();
+        registry
+            .register(Box::new(inscription_transfers_per_block.clone()))
+            .unwrap();
+
+        let last_indexed_block_height_by_protocol = IntGaugeVec::new(
+            Opts::new(
+                "last_indexed_block_height_by_protocol",
+                "Height of the most recently indexed block, labeled by protocol.",
+            ),
+            &["protocol"],
+        )
+        .unwrap();
+        registry
+            .register(Box::new(last_indexed_block_height_by_protocol.clone()))
+            .unwrap();
+
         PrometheusMonitoring {
             last_indexed_block_height,
             last_indexed_rune_number,
@@ -198,6 +265,10 @@ impl PrometheusMonitoring {
             block_standardize_errors_total,
             block_download_errors_total,
             failed_blocks_pending,
+            block_indexing_duration_seconds,
+            inscription_reveals_per_block,
+            inscription_transfers_per_block,
+            last_indexed_block_height_by_protocol,
             registry,
         }
     }
@@ -315,6 +386,34 @@ impl PrometheusMonitoring {
     pub fn metrics_record_runes_etching_inputs_checked_per_block(&self, inputs_count: u64) {
         self.runes_etching_inputs_checked_per_block
             .set(inputs_count);
+    }
+
+    // SKRYBITDEV-301: per-protocol completion observer for runes. Always
+    // emits with `protocol="runes"`; the function signature mirrors the
+    // ordinals counterpart so the call sites read the same.
+    pub fn metrics_record_block_completion(
+        &self,
+        protocol: &str,
+        block_height: u64,
+        elapsed_seconds: f64,
+        reveals: u64,
+        transfers: u64,
+    ) {
+        self.block_indexing_duration_seconds
+            .with_label_values(&[protocol])
+            .observe(elapsed_seconds);
+        self.inscription_reveals_per_block
+            .with_label_values(&[protocol])
+            .observe(reveals as f64);
+        self.inscription_transfers_per_block
+            .with_label_values(&[protocol])
+            .observe(transfers as f64);
+        let gauge = self
+            .last_indexed_block_height_by_protocol
+            .with_label_values(&[protocol]);
+        if (block_height as i64) > gauge.get() {
+            gauge.set(block_height as i64);
+        }
     }
 }
 

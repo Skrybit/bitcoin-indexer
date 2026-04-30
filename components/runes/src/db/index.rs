@@ -237,6 +237,15 @@ pub async fn index_block(
     // Record overall processing time
     let elapsed = stopwatch.elapsed();
     prometheus.metrics_record_block_processing_time(elapsed.as_millis() as f64);
+    // SKRYBITDEV-301: per-protocol per-block metrics. For runes, reveals =
+    // etchings + mints (creation-style ops); transfers = edicts (transfer-style).
+    prometheus.metrics_record_block_completion(
+        "runes",
+        block_height,
+        elapsed.as_secs_f64(),
+        etching_count + mint_count,
+        edict_count,
+    );
     try_info!(
         ctx,
         "RunesIndexer indexed block #{block_height}: {etching_count} etchings, {mint_count} mints, {edict_count} edicts, {cenotaph_count} cenotaphs ({cenotaph_etching_count} etchings, {cenotaph_mint_count} mints) in {}s",

@@ -271,6 +271,15 @@ pub async fn index_block(
     // Record overall processing time
     let elapsed = stopwatch.elapsed();
     prometheus.metrics_record_block_processing_time(elapsed.as_millis() as f64);
+    // SKRYBITDEV-301: per-protocol per-block metrics, emitted next to the
+    // existing log line so the two stay in lock-step.
+    prometheus.metrics_record_block_completion(
+        "inscription",
+        block_height,
+        elapsed.as_secs_f64(),
+        reveals_count as u64,
+        transfers_count as u64,
+    );
     try_info!(
         ctx,
         "Completed inscription indexing for block #{block_height}: found {reveals_count} inscription reveals and {transfers_count} inscription transfers in {elapsed:.0}s",
