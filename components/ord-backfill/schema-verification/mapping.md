@@ -202,3 +202,66 @@ to skip ahead and start at chain tip.
    set NULL.
 4. Does `--index-addresses` give us `inscriptions.address` reliably
    even when sats aren't indexed? Likely yes, but verify.
+
+## Confirmed against production ord (0.22.2 @ 10.20.20.61)
+
+The prod NJ box runs ord 0.22.2 in a docker container with sat +
+address indexing on (no runes). Probe of block 825000 yielded:
+
+```json
+{
+  "id": "f0095869b052adc467ae5f2667e887a9be1c8aa099c92e671529e930f6963c16i0",
+  "number": 53939229,
+  "sat": 1086209722066636,
+  "output": "08b0214f0badb49ebaa388b037a4b811012738d474737d7f41cc6ae3773e5bca:0",
+  "satpoint": "08b0214f0badb49ebaa388b037a4b811012738d474737d7f41cc6ae3773e5bca:0:0",
+  "address": "1JzM9RiLxFVQknrtMVjfjhFXuZG1jtJsNc",
+  "content_type": "text/plain;charset=utf-8",
+  "content_length": 66,
+  "fee": 53856,
+  "value": 546,
+  "height": 825000,
+  "timestamp": 1704805522,
+  "charms": [],
+  "delegate": null
+}
+```
+
+ord 0.22 endpoint omissions vs 0.27:
+- **No `metaprotocol` field** in /r/inscription response
+- **No `parent` field** in /r/inscription response (use /r/parents/<id>)
+- Otherwise endpoint shapes match what we documented above
+
+NOT NULL columns we cannot fill from ord HTTP alone:
+| column | resolution |
+| --- | --- |
+| `tx_index` | requires bitcoind RPC (`getblock` returns ordered tx list); for backfill set 0 + let live indexer correct |
+| `input_index` | requires raw tx parse; default 0 |
+| `classic_number` | for non-cursed = `number`; cursed inscriptions have negative `number` per ord conventions, but charm-driven cursed-ness in 0.22+ is incomplete. Use `number` for both fields during backfill |
+| `content` (BYTEA NOT NULL) | fetch via `GET /content/<id>` per inscription. Adds 1 HTTP call per inscription on top of the metadata call. |
+| `mime_type` | derive from `content_type` (split on `;`, take first segment) |
+
+## Phase-1 backfill table set + writer plan
+
+Tables we write (and DDL we'll mirror as staging tables for COPY):
+
+| Table | Source | NOT NULL fields filled by translator |
+| --- | --- | --- |
+| `inscriptions` | `/r/inscription/<id>` + `/content/<id>` | id, ordinal_number=sat, number, classic_number=number, height, hash (resolved), tx_id (split), tx_index=0, mime_type (split), content_type, content_length, content (binary), fee, input_index=0, timestamp, address |
+| `current_locations` | `/r/inscription/<id>` (same data — output + satpoint suffices) | ordinal_number=sat, block_height=height, tx_id (split from id), tx_index=0, address, output, offset (split from satpoint) |
+| `satoshis` | derived purely from sat number — no ord call | ordinal_number=sat, rarity (computed), coinbase_height (computed) |
+| `chain_tip` | one row update | block_height = max processed, block_hash = `/r/blockhash/<h>` |
+
+Procedure per block:
+1. `GET /inscriptions/block/<h>/<page>` until `more=false` — collect IDs
+2. For each id concurrent (semaphore-bounded):
+   - `GET /r/inscription/<id>` — metadata
+   - `GET /content/<id>` — content bytes
+3. Resolve `block_hash` once per block via `/r/blockhash/<h>`
+4. COPY all rows into staging tables (`_backfill_staging.<table>`)
+5. After block: `INSERT ... ON CONFLICT (pk) DO UPDATE` from staging into final
+6. UPDATE `chain_tip` with this block's height + hash
+
+Staging schema isolates writes — `_backfill_staging` is separate from
+`public`, dropped/recreated per run. Avoids polluting the canonical
+tables until the upsert step succeeds.
