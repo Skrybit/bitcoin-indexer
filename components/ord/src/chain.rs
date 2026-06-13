@@ -43,7 +43,9 @@ impl Chain {
         match self {
             Self::Mainnet => 767430,
             Self::Regtest => 0,
-            Self::Signet => 112402,
+            // Skrybit: private signet → inscriptions active from block 1 (see
+            // ordinals/src/core/mod.rs for rationale).
+            Self::Signet => 1,
             Self::Testnet => 2413343,
             Self::Testnet4 => 0,
         }
@@ -57,7 +59,9 @@ impl Chain {
         match self {
             Self::Mainnet => 824544,
             Self::Regtest => 110,
-            Self::Signet => 175392,
+            // Skrybit: private signet → jubilee at block 1 so test inscriptions
+            // are "blessed" (positive numbers) from the start.
+            Self::Signet => 1,
             Self::Testnet => 2544192,
             Self::Testnet4 => 0,
         }

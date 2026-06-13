@@ -18,7 +18,11 @@ pub fn first_inscription_height(config: &Config) -> u64 {
         Network::Regtest => 1,
         Network::Testnet => 2413343,
         Network::Testnet4 => 0,
-        Network::Signet => 112402,
+        // Skrybit: we only run a PRIVATE signet (custom challenge) as a
+        // controllable inscription playground, so inscriptions are active from
+        // the start rather than the public signet's historical height 112402.
+        // 1 (not 0) avoids the `first_inscription_height(config) - 1` underflow.
+        Network::Signet => 1,
         _ => unreachable!(),
     }
 }
