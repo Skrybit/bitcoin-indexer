@@ -22,6 +22,7 @@ use crate::core::meta_protocols::brc20::{
     brc20_activation_height,
     parser::{parse_brc20_operation, ParsedBrc20Operation},
 };
+use crate::utils::format_inscription_id;
 
 pub fn parse_inscriptions_from_witness(
     input_index: usize,
@@ -134,7 +135,22 @@ pub fn parse_inscriptions_from_standardized_tx(
                     if brc20.enabled && block_identifier.index >= brc20_activation_height(network) {
                         match parse_brc20_operation(&inscription) {
                             Ok(Some(op)) => {
-                                brc20_operation_map.insert(reveal.inscription_id.clone(), op);
+                                // SKRYBITDEV-638: key by the SAME id the sequencing step will
+                                // assign (`format_inscription_id` — non-reversed txid + per-tx
+                                // subindex), NOT `reveal.inscription_id` (which is the parse-time
+                                // `InscriptionId.to_string()` with a reversed txid and the input
+                                // index). The sequencing step rewrites `inscription_id` before the
+                                // BRC-20 writer runs, so keying it any other way makes every writer
+                                // lookup miss and silently drops the op. `operations.len()` is this
+                                // reveal's subindex (reveals are pushed below, in the same order
+                                // the sequencer counts them).
+                                brc20_operation_map.insert(
+                                    format_inscription_id(
+                                        &tx.transaction_identifier,
+                                        operations.len(),
+                                    ),
+                                    op,
+                                );
                             }
                             Ok(None) => {}
                             Err(e) => {
@@ -209,5 +225,59 @@ mod test {
         );
         assert_eq!(reveal.content_bytes, "0x7b200a20202270223a20226272632d3230222c0a2020226f70223a20226465706c6f79222c0a2020227469636b223a20226f726469222c0a2020226d6178223a20223231303030303030222c0a2020226c696d223a202231303030220a7d".to_string());
         assert_eq!(reveal.content_length, 94);
+    }
+
+    // SKRYBITDEV-638: the BRC-20 operation map must be keyed by the canonical
+    // (post-sequencing) inscription id — `format_inscription_id` — so the
+    // writer's lookup hits. Before the fix the map was keyed by the parse-time
+    // `reveal.inscription_id` (reversed txid + input index), which never matches
+    // the id the sequencer assigns, so every BRC-20 op was silently dropped.
+    #[test]
+    fn brc20_operation_map_keyed_by_canonical_inscription_id() {
+        use config::{OrdinalsBrc20Config, OrdinalsMetaProtocolsConfig};
+
+        use super::format_inscription_id;
+
+        let ctx = Context::empty();
+        let mut config = Config::test_default();
+        // Enable BRC-20 so parsing populates the operation map.
+        let ordinals = config.ordinals.as_mut().unwrap();
+        ordinals.meta_protocols = Some(OrdinalsMetaProtocolsConfig {
+            brc20: Some(OrdinalsBrc20Config {
+                enabled: true,
+                lru_cache_size: 1,
+                db: ordinals.db.clone(),
+            }),
+        });
+
+        // A valid BRC-20 deploy inscription, at a height past mainnet activation.
+        let mut block = TestBlockBuilder::new()
+            .height(800_000)
+            .add_transaction(
+                TestTransactionBuilder::new()
+                    .add_input(
+                        TestTxInBuilder::new()
+                            .witness(vec![
+                                "0x6c00eb3c4d35fedd257051333b4ca81d1a25a37a9af4891f1fec2869edd56b14180eafbda8851d63138a724c9b15384bc5f0536de658bd294d426a36212e6f08".to_string(),
+                                "0x209e2849b90a2353691fccedd467215c88eec89a5d0dcf468e6cf37abed344d746ac0063036f7264010118746578742f706c61696e3b636861727365743d7574662d38004c5e7b200a20202270223a20226272632d3230222c0a2020226f70223a20226465706c6f79222c0a2020227469636b223a20226f726469222c0a2020226d6178223a20223231303030303030222c0a2020226c696d223a202231303030220a7d68".to_string(),
+                                "0xc19e2849b90a2353691fccedd467215c88eec89a5d0dcf468e6cf37abed344d746".to_string(),
+                            ])
+                            .build(),
+                    )
+                    .build(),
+            )
+            .build();
+
+        let mut brc20_map = HashMap::new();
+        parse_inscriptions_in_standardized_block(&mut block, &mut brc20_map, &config, &ctx);
+
+        let expected_key =
+            format_inscription_id(&block.transactions[0].transaction_identifier, 0);
+        assert!(
+            brc20_map.contains_key(&expected_key),
+            "BRC-20 map keyed by {:?}, expected canonical id {}",
+            brc20_map.keys().collect::<Vec<_>>(),
+            expected_key,
+        );
     }
 }
