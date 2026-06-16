@@ -1209,7 +1209,7 @@ pub async fn rollback_block<T: GenericClient>(block_height: u64, client: &T) -> 
             "WITH new_owners AS (
                 SELECT address, COUNT(*) AS count
                 FROM current_locations
-                WHERE ordinal_number = ANY ($1)
+                WHERE ordinal_number = ANY ($1) AND address IS NOT NULL
                 GROUP BY address
             )
             INSERT INTO counts_by_address (address, count)
