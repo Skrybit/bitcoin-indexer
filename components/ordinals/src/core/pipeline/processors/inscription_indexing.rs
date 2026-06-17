@@ -9,7 +9,7 @@ use std::{
 
 use bitcoind::{
     try_info, try_warn,
-    types::{BitcoinBlockData, OrdinalOperation, TransactionBytesCursor, TransactionIdentifier},
+    types::{BitcoinBlockData, TransactionBytesCursor, TransactionIdentifier},
     utils::Context,
 };
 use config::Config;
@@ -193,46 +193,6 @@ pub async fn index_block(
             // Count BRC-20 operations before processing
             let brc20_ops_count = brc20_operation_map.len() as u64;
             prometheus.metrics_record_brc20_operations_per_block(brc20_ops_count);
-
-            // BRC20DEBUG (TEMPORARY — SKRYBITDEV-638): why does the writer's
-            // lookup (`brc20_operation_map.get(&reveal.inscription_id)`) miss
-            // every entry? Log how many revealed inscription ids actually match
-            // a map key, plus a sample of each for format comparison.
-            if !brc20_operation_map.is_empty() {
-                let reveal_ids: Vec<String> = block
-                    .transactions
-                    .iter()
-                    .flat_map(|t| &t.metadata.ordinal_operations)
-                    .filter_map(|op| match op {
-                        OrdinalOperation::InscriptionRevealed(r) => {
-                            Some(r.inscription_id.clone())
-                        }
-                        _ => None,
-                    })
-                    .collect();
-                let in_map = reveal_ids
-                    .iter()
-                    .filter(|id| brc20_operation_map.contains_key(*id))
-                    .count();
-                let (mut nd, mut nm, mut nt) = (0u32, 0u32, 0u32);
-                for v in brc20_operation_map.values() {
-                    match v {
-                        crate::core::meta_protocols::brc20::parser::ParsedBrc20Operation::Deploy(_) => nd += 1,
-                        crate::core::meta_protocols::brc20::parser::ParsedBrc20Operation::Mint(_) => nm += 1,
-                        crate::core::meta_protocols::brc20::parser::ParsedBrc20Operation::Transfer(_) => nt += 1,
-                    }
-                }
-                try_info!(
-                    ctx,
-                    "BRC20DEBUG block#{} map_size={} reveals_in_map={} map_deploys={} map_mints={} map_transfers={} sample_map_key={:?} sample_reveal={:?}",
-                    block.block_identifier.index,
-                    brc20_operation_map.len(),
-                    in_map,
-                    nd, nm, nt,
-                    brc20_operation_map.keys().next(),
-                    reveal_ids.first()
-                );
-            }
 
             if let Err(e) = index_block_and_insert_brc20_operations(
                 block,
