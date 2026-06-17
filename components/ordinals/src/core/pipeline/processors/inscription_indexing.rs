@@ -214,13 +214,21 @@ pub async fn index_block(
                     .iter()
                     .filter(|id| brc20_operation_map.contains_key(*id))
                     .count();
+                let (mut nd, mut nm, mut nt) = (0u32, 0u32, 0u32);
+                for v in brc20_operation_map.values() {
+                    match v {
+                        crate::core::meta_protocols::brc20::parser::ParsedBrc20Operation::Deploy(_) => nd += 1,
+                        crate::core::meta_protocols::brc20::parser::ParsedBrc20Operation::Mint(_) => nm += 1,
+                        crate::core::meta_protocols::brc20::parser::ParsedBrc20Operation::Transfer(_) => nt += 1,
+                    }
+                }
                 try_info!(
                     ctx,
-                    "BRC20DEBUG block#{} map_size={} reveals={} reveals_in_map={} sample_map_key={:?} sample_reveal={:?}",
+                    "BRC20DEBUG block#{} map_size={} reveals_in_map={} map_deploys={} map_mints={} map_transfers={} sample_map_key={:?} sample_reveal={:?}",
                     block.block_identifier.index,
                     brc20_operation_map.len(),
-                    reveal_ids.len(),
                     in_map,
+                    nd, nm, nt,
                     brc20_operation_map.keys().next(),
                     reveal_ids.first()
                 );
