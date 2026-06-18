@@ -447,7 +447,14 @@ pub(crate) fn standardize_bitcoin_block(
             sats_out += value;
             outputs.push(TxOut {
                 value,
-                script_pubkey: format!("0x{}", hex::encode(&output.script_pub_key.hex)),
+                // SKRYBITDEV-638: `script_pub_key.hex` is ALREADY a hex string
+                // (SKRYBITDEV-587 changed this field from the upstream
+                // `Vec<u8>` to `String` but left the `hex::encode` caller in
+                // place, double-encoding every scriptPubKey). Double-encoding
+                // makes `Address::from_script` fail for every output, so
+                // `inscriber_address` is never set and the BRC-20 verifier
+                // rejects every op — silently killing BRC-20 fleet-wide.
+                script_pubkey: format!("0x{}", output.script_pub_key.hex),
             });
         }
 
