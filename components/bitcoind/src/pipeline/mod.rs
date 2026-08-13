@@ -43,6 +43,13 @@ pub(crate) enum BlockProcessorCommand {
         error_kind: String,
         error_message: String,
     },
+    /// Barrier used by the block download pipeline to wait until every command
+    /// enqueued before it has been processed. The processor acks and keeps
+    /// running — it must stay alive for follow-up catch-up rounds and the ZMQ
+    /// live-follow after catch-up. See INFRA-181.
+    Flush {
+        ack_tx: crossbeam_channel::Sender<()>,
+    },
     Terminate,
 }
 
@@ -307,6 +314,12 @@ pub(crate) async fn block_processor_runloop(
                     config,
                     ctx,
                 )?;
+                continue;
+            }
+            Ok(BlockProcessorCommand::Flush { ack_tx }) => {
+                // INFRA-181: every command enqueued before this barrier has been
+                // processed. Ack and keep looping — do not exit.
+                let _ = ack_tx.send(());
                 continue;
             }
             Ok(BlockProcessorCommand::Terminate) => {

@@ -56,12 +56,9 @@ pub(crate) async fn start_zeromq_pipeline(
     );
 
     loop {
-        // Check if the indexer has been interrupted. If so, send a terminate command to the block processor.
+        // Check if the indexer has been interrupted. If so, stop streaming. INFRA-181:
+        // `start_bitcoin_indexer` owns BlockProcessor shutdown — do not Terminate it here.
         if abort_signal.load(Ordering::SeqCst) {
-            block_processor
-                .commands_tx
-                .send(BlockProcessorCommand::Terminate)
-                .map_err(|e| e.to_string())?;
             return Ok(());
         }
 

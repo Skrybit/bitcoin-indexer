@@ -18,7 +18,7 @@ use crate::{
         rpc::{
             parse_downloaded_block, standardize_bitcoin_block, try_download_block_bytes_with_retry,
         },
-        wait_for_thread_finish, BlockProcessor, BlockProcessorCommand,
+        BlockProcessor, BlockProcessorCommand,
     },
     try_debug, try_error, try_info,
     types::{BitcoinBlockData, BitcoinNetwork, BlockBytesCursor},
@@ -122,85 +122,92 @@ pub(crate) async fn start_block_download_pipeline(
                     if cloned_abort_signal.load(Ordering::SeqCst) {
                         break;
                     }
-                    if let Ok(Some((block_height, block_bytes))) = rx.recv() {
-                        // Parse — on failure, send Failed skip marker to dispatcher so the
-                        // cursor can advance past this height without stalling the pipeline.
-                        // SKRYBITDEV-586: was `.expect("unable to parse block")` which
-                        // panicked the thread and stuck the watermark.
-                        let raw_block_data = match parse_downloaded_block(block_bytes) {
-                            Ok(data) => data,
+                    // INFRA-181: exit on the `None` termination sentinel (or a
+                    // disconnected channel). This previously only matched
+                    // `Ok(Some(_))`, so the sentinel was swallowed and the thread
+                    // parked forever on the next `recv()` — hanging the compressor
+                    // `join()` at the end of the pipeline and preventing the ZMQ
+                    // live-follow from ever starting after catch-up.
+                    let Ok(Some((block_height, block_bytes))) = rx.recv() else {
+                        break;
+                    };
+                    // Parse — on failure, send Failed skip marker to dispatcher so the
+                    // cursor can advance past this height without stalling the pipeline.
+                    // SKRYBITDEV-586: was `.expect("unable to parse block")` which
+                    // panicked the thread and stuck the watermark.
+                    let raw_block_data = match parse_downloaded_block(block_bytes) {
+                        Ok(data) => data,
+                        Err(e) => {
+                            try_error!(
+                                moved_ctx,
+                                "BlockCompressor[{thread_index}]: parse failed for block #{block_height}, skipping. error={e}"
+                            );
+                            let _ =
+                                block_dispatcher_tx_moved.send(Some(DispatcherMessage::Failed {
+                                    block_height,
+                                    error_kind: "parse",
+                                    error_message: e,
+                                }));
+                            continue;
+                        }
+                    };
+
+                    // Compress — on failure, same skip-and-log behavior.
+                    let compressed_block = if compress_blocks {
+                        match BlockBytesCursor::from_full_block(&raw_block_data) {
+                            Ok(c) => Some(c),
                             Err(e) => {
                                 try_error!(
                                     moved_ctx,
-                                    "BlockCompressor[{thread_index}]: parse failed for block #{block_height}, skipping. error={e}"
+                                    "BlockCompressor[{thread_index}]: compress failed for block #{block_height}, skipping. error={e}"
                                 );
-                                let _ =
-                                    block_dispatcher_tx_moved.send(Some(DispatcherMessage::Failed {
+                                let _ = block_dispatcher_tx_moved.send(Some(
+                                    DispatcherMessage::Failed {
                                         block_height,
-                                        error_kind: "parse",
-                                        error_message: e,
-                                    }));
+                                        error_kind: "compress",
+                                        error_message: e.to_string(),
+                                    },
+                                ));
                                 continue;
                             }
-                        };
+                        }
+                    } else {
+                        None
+                    };
 
-                        // Compress — on failure, same skip-and-log behavior.
-                        let compressed_block = if compress_blocks {
-                            match BlockBytesCursor::from_full_block(&raw_block_data) {
-                                Ok(c) => Some(c),
-                                Err(e) => {
-                                    try_error!(
-                                        moved_ctx,
-                                        "BlockCompressor[{thread_index}]: compress failed for block #{block_height}, skipping. error={e}"
-                                    );
-                                    let _ = block_dispatcher_tx_moved.send(Some(
-                                        DispatcherMessage::Failed {
-                                            block_height,
-                                            error_kind: "compress",
-                                            error_message: e.to_string(),
-                                        },
-                                    ));
-                                    continue;
-                                }
+                    // Standardize (only for blocks >= start_sequencing_blocks_at_height) —
+                    // on failure, same skip-and-log behavior.
+                    let block_data = if block_height >= start_sequencing_blocks_at_height {
+                        match standardize_bitcoin_block(
+                            raw_block_data,
+                            &BitcoinNetwork::from_network(moved_bitcoin_network),
+                            &moved_ctx,
+                        ) {
+                            Ok(block) => Some(block),
+                            Err((e, _fatal)) => {
+                                try_error!(
+                                    moved_ctx,
+                                    "BlockCompressor[{thread_index}]: standardize failed for block #{block_height}, skipping. error={e}"
+                                );
+                                let _ = block_dispatcher_tx_moved.send(Some(
+                                    DispatcherMessage::Failed {
+                                        block_height,
+                                        error_kind: "standardize",
+                                        error_message: e,
+                                    },
+                                ));
+                                continue;
                             }
-                        } else {
-                            None
-                        };
+                        }
+                    } else {
+                        None
+                    };
 
-                        // Standardize (only for blocks >= start_sequencing_blocks_at_height) —
-                        // on failure, same skip-and-log behavior.
-                        let block_data = if block_height >= start_sequencing_blocks_at_height {
-                            match standardize_bitcoin_block(
-                                raw_block_data,
-                                &BitcoinNetwork::from_network(moved_bitcoin_network),
-                                &moved_ctx,
-                            ) {
-                                Ok(block) => Some(block),
-                                Err((e, _fatal)) => {
-                                    try_error!(
-                                        moved_ctx,
-                                        "BlockCompressor[{thread_index}]: standardize failed for block #{block_height}, skipping. error={e}"
-                                    );
-                                    let _ = block_dispatcher_tx_moved.send(Some(
-                                        DispatcherMessage::Failed {
-                                            block_height,
-                                            error_kind: "standardize",
-                                            error_message: e,
-                                        },
-                                    ));
-                                    continue;
-                                }
-                            }
-                        } else {
-                            None
-                        };
-
-                        let _ = block_dispatcher_tx_moved.send(Some(DispatcherMessage::Ok {
-                            block_height,
-                            block: block_data,
-                            compacted: compressed_block,
-                        }));
-                    }
+                    let _ = block_dispatcher_tx_moved.send(Some(DispatcherMessage::Ok {
+                        block_height,
+                        block: block_data,
+                        compacted: compressed_block,
+                    }));
                 }
                 try_info!(moved_ctx, "BlockCompressor[{thread_index}] thread complete");
             })
@@ -228,7 +235,10 @@ pub(crate) async fn start_block_download_pipeline(
                         cloned_ctx,
                         "Pipeline successfully sent {blocks_processed} blocks to processor"
                     );
-                    let _ = block_processor_commands_tx.send(BlockProcessorCommand::Terminate);
+                    // INFRA-181: do NOT send Terminate here — the BlockProcessor must
+                    // stay alive for follow-up catch-up rounds and the ZMQ live-follow.
+                    // The pipeline tail issues a Flush barrier instead, and
+                    // `start_bitcoin_indexer` owns the final Terminate.
                     break;
                 }
 
@@ -458,12 +468,26 @@ pub(crate) async fn start_block_download_pipeline(
 
     try_debug!(ctx, "Pipeline successfully terminated");
 
-    wait_for_thread_finish(&mut block_processor.thread_handle)?;
-
     let _ = block_dispatcher_tx.send(None);
 
     let _ = block_dispatcher_thread.join();
     let _ = rpc_handles.shutdown().await;
+
+    // INFRA-181: barrier — wait until the BlockProcessor has drained every command
+    // the dispatcher enqueued, WITHOUT terminating it. The processor thread must
+    // survive this pipeline run so `start_bitcoin_indexer` can run further catch-up
+    // rounds and the ZMQ live-follow against the same processor. Previously we sent
+    // Terminate and joined the thread here, which left the ZMQ streamer talking to
+    // a dead channel and wedged the process at chain tip.
+    let (ack_tx, ack_rx) = bounded::<()>(1);
+    let flush_ok = block_processor
+        .commands_tx
+        .send(BlockProcessorCommand::Flush { ack_tx })
+        .is_ok()
+        && ack_rx.recv().is_ok();
+    if !flush_ok && !abort_signal.load(Ordering::SeqCst) {
+        return Err("BlockProcessor terminated unexpectedly during pipeline flush".into());
+    }
 
     try_debug!(
         ctx,

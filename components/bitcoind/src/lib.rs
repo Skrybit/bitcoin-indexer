@@ -181,6 +181,15 @@ pub async fn start_bitcoin_indexer(
         .await?;
     }
 
+    // Terminate the block processor and wait for it to finish. INFRA-181: the processor is no
+    // longer terminated inside the download pipeline — it stays alive through catch-up rounds
+    // and the ZMQ live-follow, so it must be shut down here. Absorb the send error in case the
+    // processor already exited from the abort signal.
+    let _ = block_processor
+        .commands_tx
+        .send(BlockProcessorCommand::Terminate);
+    wait_for_thread_finish(&mut block_processor.thread_handle)?;
+
     // Send a terminate command to the indexer and wait for it to finish. Absorb the error here in case the indexer is already
     // terminated from the abort signal.
     let _ = indexer.commands_tx.send(IndexerCommand::Terminate);
