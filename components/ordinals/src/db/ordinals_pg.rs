@@ -616,6 +616,19 @@ async fn insert_locations<T: GenericClient>(
                                     )
                                     ORDER BY l.block_height DESC, l.tx_index DESC
                                     LIMIT 1
+                                ),
+                                -- INFRA-213 / ADR-079 §2: `locations` history is pruned past the
+                                -- retention window, but `current_locations` never is. When a sat
+                                -- last moved before the pruning horizon, branches 1-2 find nothing;
+                                -- fall back to its current (end-of-previous-block) position, which
+                                -- is correct because insert_current_locations runs AFTER this
+                                -- statement in insert_block, so current_locations still reflects
+                                -- the sat's location prior to this block. Intra-block hops resolve
+                                -- via branches 1-2 first.
+                                (
+                                    SELECT cl.block_height || ',' || cl.tx_index
+                                    FROM current_locations AS cl
+                                    WHERE cl.ordinal_number = li.ordinal_number
                                 )
                             ) AS from_data,
                             (ROW_NUMBER() OVER (ORDER BY li.block_height ASC, li.tx_index ASC) + (SELECT COALESCE(max, -1) FROM prev_transfer_index)) AS block_transfer_index
